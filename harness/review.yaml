@@ -38,6 +38,9 @@ host_files:
   - src: ${PRIOR_REVIEW_FILE}
     dest: /sandbox/workspace/prior-review.txt
     optional: true
+  - src: ${HUMAN_RESOLVED_FILE}
+    dest: /sandbox/workspace/human-resolved-threads.json
+    optional: true
 
 pre_script: scripts/pre-review.sh
 post_script: scripts/post-review.sh

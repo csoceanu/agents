@@ -301,6 +301,39 @@ run_prior_projection_test() {
   echo "PASS: ${test_name}"
 }
 
+run_human_resolution_test() {
+  local test_name="$1"
+  local prior_projection="$2"
+  local human_threads="$3"
+  local expected_jq="$4"
+  local prior_file="${TMPDIR}/human-prior-${test_name}.txt"
+  local human_file="${TMPDIR}/human-threads-${test_name}.json"
+  printf '%s\n' "$(projection_marker "${prior_projection}")" > "${prior_file}"
+  printf '%s\n' "${human_threads}" > "${human_file}"
+
+  local mock_bin
+  mock_bin="$(build_mock "OPEN" "some-human")"
+  env \
+    PATH="${mock_bin}:${PATH}" \
+    PR_URL="https://github.com/test-org/test-repo/pull/42" \
+    FULLSEND_FORGE="github" \
+    REVIEW_TOKEN="" \
+    PRIOR_REVIEW_FILE="${prior_file}" \
+    PRIOR_REVIEW_PROVENANCE="app-verified" \
+    HUMAN_RESOLVED_FILE="${human_file}" \
+    bash "${SCRIPT_DIR}/pre-review.sh" \
+    > "${TMPDIR}/stdout-${test_name}.log" 2>&1
+
+  if ! jq -e "${expected_jq}" "${prior_file}" >/dev/null 2>&1; then
+    echo "FAIL: ${test_name} — human-resolution disposition mismatch"
+    cat "${prior_file}"
+    cat "${TMPDIR}/stdout-${test_name}.log"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+  echo "PASS: ${test_name}"
+}
+
 projection_marker() {
   local projection="$1"
   local encoded
@@ -437,6 +470,38 @@ run_prior_projection_test "legacy-findings-get-minted-ids" \
   "$(projection_marker "${VALID_PROJECTION}")" \
   "app-verified" \
   "${VALID_PROJECTION}"
+
+HUMAN_DISMISSAL_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"naming-convention","file":"src/foo.go","line":4,"id":"f_human1"}],"dispositions":[{"id":"f_human1","status":"open"}]}'
+HUMAN_DISMISSAL_THREADS='{"resolved_threads":[{"finding_id":"f_human1","file":"src/foo.go","line":4,"original_line":4,"resolved_by":"alice"}]}'
+run_human_resolution_test "exact-id-dismissal" \
+  "${HUMAN_DISMISSAL_PROJECTION}" \
+  "${HUMAN_DISMISSAL_THREADS}" \
+  '.dispositions == [{"id":"f_human1","status":"dismissed_by_human"}]'
+
+FUZZY_DISMISSAL_PROJECTION='{"version":2,"findings":[{"severity":"medium","category":"logic-error","file":"src/add.go","line":9,"id":"f_fuzzy1"}],"dispositions":[{"id":"f_fuzzy1","status":"open"}]}'
+FUZZY_DISMISSAL_THREADS='{"resolved_threads":[{"finding_id":null,"file":"src/add.go","line":9,"original_line":8,"resolved_by":"bob"}]}'
+run_human_resolution_test "file-line-fallback" \
+  "${FUZZY_DISMISSAL_PROJECTION}" \
+  "${FUZZY_DISMISSAL_THREADS}" \
+  '.dispositions == [{"id":"f_fuzzy1","status":"dismissed_by_human"}]'
+
+SHIFTED_DISMISSAL_THREADS='{"resolved_threads":[{"finding_id":null,"file":"src/add.go","line":13,"original_line":13,"resolved_by":"bob"}]}'
+run_human_resolution_test "file-line-fallback-allows-small-shift" \
+  "${FUZZY_DISMISSAL_PROJECTION}" \
+  "${SHIFTED_DISMISSAL_THREADS}" \
+  '.dispositions == [{"id":"f_fuzzy1","status":"dismissed_by_human"}]'
+
+SECURITY_RECLASSIFICATION_PROJECTION='{"version":2,"findings":[{"severity":"high","category":"auth-bypass","file":"src/auth.go","line":12,"id":"f_security1"}],"dispositions":[{"id":"f_security1","status":"open"}]}'
+SECURITY_RECLASSIFICATION_THREADS='{"resolved_threads":[{"finding_id":"f_security1","file":"src/auth.go","line":12,"original_line":12,"resolved_by":"security-reviewer"}]}'
+run_human_resolution_test "security-reclassification" \
+  "${SECURITY_RECLASSIFICATION_PROJECTION}" \
+  "${SECURITY_RECLASSIFICATION_THREADS}" \
+  '.findings[0].severity == "high" and .dispositions == [{"id":"f_security1","status":"reclassified"}]'
+
+run_human_resolution_test "malformed-human-file-is-fail-open" \
+  "${HUMAN_DISMISSAL_PROJECTION}" \
+  '{"resolved_threads":[{"finding_id":"not-valid"}]}' \
+  '.dispositions == [{"id":"f_human1","status":"open"}]'
 
 # Dispositions carry structured metadata only. Free text from an earlier
 # review (rationale, evidence) must never reach the sandbox.

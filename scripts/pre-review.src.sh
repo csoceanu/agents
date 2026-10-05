@@ -12,6 +12,7 @@
 #   REVIEW_SKIP_AUTHORS — comma-separated author list to skip
 #   PRIOR_REVIEW_FILE   — prior sticky review body; rewritten to validated JSON
 #   PRIOR_REVIEW_PROVENANCE — authenticated provenance for the prior review
+#   HUMAN_RESOLVED_FILE — optional fullsend JSON of human-resolved review threads
 set -euo pipefail
 
 : "${PR_URL:?PR_URL must be set}"
@@ -166,9 +167,91 @@ validate_prior_review_projection() {
   fi
 }
 
+# Apply human-resolved thread context to the validated prior finding ledger.
+# The thread file is untrusted evidence: only its finding_id, file, line, and
+# original_line are used for matching, and only the disposition status is
+# copied into the prior projection. Comment bodies never enter the sandbox
+# through this path.
+apply_human_resolutions() {
+  local prior_file="$1"
+  local human_file="$2"
+  local tmp_file
+
+  [[ -s "${prior_file}" && -s "${human_file}" ]] || return 0
+
+  if ! jq -e '
+    type == "object" and
+    (.resolved_threads | type == "array") and
+    all(.resolved_threads[];
+      type == "object" and
+      (.finding_id == null or (.finding_id | type == "string" and test("^f_[A-Za-z0-9]+$"))) and
+      (.file == null or (.file | type == "string")) and
+      (.line == null or (.line | type == "number")) and
+      (.original_line == null or (.original_line | type == "number"))
+    )
+  ' "${human_file}" >/dev/null 2>&1; then
+    echo "::warning::Human-resolved thread file rejected — keeping prior dispositions unchanged"
+    return 0
+  fi
+
+  tmp_file="$(mktemp "${prior_file}.resolved.XXXXXX")"
+  if ! jq --slurpfile human "${human_file}" '
+    def security_category:
+      IN(
+        "auth-bypass", "rbac-violation", "data-exposure", "privilege-escalation",
+        "injection-vuln", "sandbox-escape", "xss", "ssrf",
+        "insecure-deserialization", "prompt-injection", "unicode-steganography",
+        "bidi-override", "homoglyph-attack", "instruction-smuggling", "fail-open",
+        "permission-expansion", "permission-reduction", "role-escalation",
+        "workflow-permission", "secret-exposure"
+      );
+    def matching_thread($threads; $finding):
+      ([$threads[] | select($finding.id != null and .finding_id == $finding.id)]) as $exact
+      | if ($exact | length) == 1 then $exact[0]
+        else
+          [$threads[]
+           | select(.finding_id == null)
+           | select(.file == $finding.file)
+           | select(
+               ((.line != null and (($finding.line - .line) | fabs) <= 5) or
+                (.original_line != null and (($finding.line - .original_line) | fabs) <= 5))
+             )]
+          | if length == 1 then .[0] else null end
+        end;
+    ($human[0].resolved_threads // []) as $threads
+    | . as $projection
+    | [
+        $projection.findings[]
+        | . as $finding
+        | (matching_thread($threads; $finding)) as $thread
+        | select($thread != null)
+        | {
+            id: $finding.id,
+            status: (if ($finding.severity | IN("high", "critical") and ($finding.category | security_category))
+                     then "reclassified"
+                     else "dismissed_by_human"
+                     end)
+          }
+      ] as $new
+    | ([.dispositions[]? | select(.status == "resolved_by_change" or .status == "dismissed_by_human") | .id]) as $closed
+    | .dispositions = ([.dispositions[]? | select(.id as $id | (any($new[]; .id == $id) | not))]
+      + [$new[] | select(.id != null) | select(.id as $id | ($closed | index($id)) == null)])
+  ' "${prior_file}" > "${tmp_file}"; then
+    rm -f "${tmp_file}"
+    echo "::warning::Human-resolved thread matching failed — keeping prior dispositions unchanged"
+    return 0
+  fi
+
+  mv "${tmp_file}" "${prior_file}"
+  echo "Applied human-resolved review thread dispositions"
+}
+
 if [[ -n "${PRIOR_REVIEW_FILE:-}" && -f "${PRIOR_REVIEW_FILE}" ]]; then
   case "${PRIOR_REVIEW_PROVENANCE:-none}" in
-    app-verified|bot-verified) validate_prior_review_projection "${PRIOR_REVIEW_FILE}" ;;
+    app-verified|bot-verified)
+      validate_prior_review_projection "${PRIOR_REVIEW_FILE}"
+      apply_human_resolutions "${PRIOR_REVIEW_FILE}" "${HUMAN_RESOLVED_FILE:-}"
+      ;;
     *) : > "${PRIOR_REVIEW_FILE}" ;;
   esac
 fi
