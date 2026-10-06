@@ -12,7 +12,7 @@
 #   REVIEW_SKIP_AUTHORS — comma-separated author list to skip
 #   PRIOR_REVIEW_FILE   — prior sticky review body; rewritten to validated JSON
 #   PRIOR_REVIEW_PROVENANCE — authenticated provenance for the prior review
-#   HUMAN_RESOLVED_FILE — optional fullsend JSON of human-resolved review threads
+#   HUMAN_RESOLVED_FILE — optional output path for human-resolved review threads
 set -euo pipefail
 
 : "${PR_URL:?PR_URL must be set}"
@@ -64,6 +64,20 @@ mint_missing_prior_ids() {
   rm -f "${tmp}"
   return 1
 }
+
+# Keep workflow files thin: fetch human-resolved threads from the review
+# agent's host-side pre-script, after the forge context is available.
+if [[ -x "${SCRIPT_DIR}/pre-fetch-resolved-threads.sh" &&
+      ("${GITHUB_ACTIONS:-}" == "true" || "${GITLAB_CI:-}" == "true") ]]; then
+	: "${HUMAN_RESOLVED_FILE:=${GITHUB_WORKSPACE:-/tmp}/human-resolved-threads.json}"
+	export HUMAN_RESOLVED_FILE
+  if ! REVIEW_TOKEN="${REVIEW_TOKEN:-${GH_TOKEN:-}}" \
+    REPO="${REPO}" \
+    PR_NUMBER="${PR_NUMBER}" \
+    bash "${SCRIPT_DIR}/pre-fetch-resolved-threads.sh"; then
+    echo "::warning::Human-resolved review-thread pre-fetch failed — continuing without it"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Replace the human-readable sticky review with a mechanically validated,

@@ -268,13 +268,15 @@ run_prior_projection_test() {
 
   local mock_bin
   mock_bin="$(build_mock "OPEN" "some-human")"
+  local -a ci_env=()
+  [[ "${forge}" == "gitlab" ]] && ci_env+=(CI_SERVER_HOST="gitlab.com")
   env \
     PATH="${mock_bin}:${PATH}" \
     PR_URL="${pr_url}" \
     FULLSEND_FORGE="${forge}" \
     REVIEW_TOKEN="" \
     GH_TOKEN="fake-token" \
-    CI_SERVER_HOST="gitlab.com" \
+    "${ci_env[@]}" \
     PRIOR_REVIEW_FILE="${prior_file}" \
     PRIOR_REVIEW_PROVENANCE="${provenance}" \
     bash "${SCRIPT_DIR}/pre-review.sh" \
@@ -334,6 +336,47 @@ run_human_resolution_test() {
   echo "PASS: ${test_name}"
 }
 
+run_human_resolution_fetch_test() {
+  local test_name="human-resolution-fetch-helper"
+  local output_file="${TMPDIR}/human-resolved-threads.json"
+
+  local mock_bin
+  mock_bin="$(build_mock "OPEN" "some-human")"
+
+  cat > "${mock_bin}/fullsend" <<'FULLSEND'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "${GITHUB_WORKSPACE}/fullsend-fetch-args"
+printf '%s\n' '{"threads":[],"truncated":false}'
+FULLSEND
+  chmod +x "${mock_bin}/fullsend"
+  env \
+    PATH="${mock_bin}:${PATH}" \
+    PR_URL="https://github.com/test-org/test-repo/pull/42" \
+    FULLSEND_FORGE="github" \
+    REVIEW_TOKEN="" \
+    GH_TOKEN="fake-token" \
+    GITHUB_ACTIONS="true" \
+    GITHUB_WORKSPACE="${TMPDIR}" \
+    HUMAN_RESOLVED_FILE="${output_file}" \
+    bash "${SCRIPT_DIR}/pre-review.sh" \
+    > "${TMPDIR}/stdout-${test_name}.log" 2>&1
+
+  if [[ "$(cat "${TMPDIR}/fullsend-fetch-args")" != "fetch-review-threads --forge github --repo test-org/test-repo --pr 42" ]]; then
+    echo "FAIL: ${test_name} — fullsend received the wrong PR context"
+    cat "${TMPDIR}/fullsend-fetch-args"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+  if ! jq -e '.metadata.human_resolved_count == 0' "${output_file}" >/dev/null 2>&1; then
+    echo "FAIL: ${test_name} — helper output was not written to the workspace"
+    cat "${TMPDIR}/stdout-${test_name}.log"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+  echo "PASS: ${test_name}"
+}
+
 projection_marker() {
   local projection="$1"
   local encoded
@@ -350,6 +393,8 @@ VALID_MARKER="$(projection_marker "${VALID_PROJECTION}")"
 OLD_PROJECTION='{"version":1,"findings":[{"severity":"high","category":"auth-bypass","file":"old.go"}]}'
 OLD_MARKER="$(projection_marker "${OLD_PROJECTION}")"
 FIXTURE_PROJECTION='{"version":1,"findings":[{"severity":"medium","category":"missing-doc","file":"docs/foo.md","line":null}]}'
+
+run_human_resolution_fetch_test
 
 run_prior_projection_test "valid-single-projection" \
   "${VALID_MARKER}" \
