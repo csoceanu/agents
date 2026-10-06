@@ -900,6 +900,10 @@ apply_human_resolutions() {
   local human_file="$2"
   local tmp_file
 
+  # GitLab thread resolution is not independently verifiable yet. Keep those
+  # findings open until the forge-side verification path exists.
+  [[ "${FULLSEND_FORGE:-github}" == "github" ]] || return 0
+
   [[ -s "${prior_file}" && -s "${human_file}" ]] || return 0
 
   if ! jq -e '
@@ -950,11 +954,10 @@ apply_human_resolutions() {
         | select($thread != null)
         | {
             id: $finding.id,
-            status: (if ($finding.severity | IN("high", "critical") and ($finding.category | security_category))
-                     then "reclassified"
-                     else "dismissed_by_human"
-                     end)
+            status: "dismissed_by_human"
           }
+        | select((($finding.severity | IN("high", "critical")) and
+                  ($finding.category | security_category)) | not)
       ] as $new
     | ([.dispositions[]? | select(.status == "resolved_by_change" or .status == "dismissed_by_human") | .id]) as $closed
     | .dispositions = ([.dispositions[]? | select(.id as $id | (any($new[]; .id == $id) | not))]

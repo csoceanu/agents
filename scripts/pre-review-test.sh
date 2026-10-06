@@ -308,6 +308,13 @@ run_human_resolution_test() {
   local prior_projection="$2"
   local human_threads="$3"
   local expected_jq="$4"
+  local forge="${5:-github}"
+  local pr_url="https://github.com/test-org/test-repo/pull/42"
+  local ci_server_host=""
+  if [[ "${forge}" == "gitlab" ]]; then
+    pr_url="https://gitlab.com/test-org/test-repo/-/merge_requests/42"
+    ci_server_host="gitlab.com"
+  fi
   local prior_file="${TMPDIR}/human-prior-${test_name}.txt"
   local human_file="${TMPDIR}/human-threads-${test_name}.json"
   printf '%s\n' "$(projection_marker "${prior_projection}")" > "${prior_file}"
@@ -317,8 +324,9 @@ run_human_resolution_test() {
   mock_bin="$(build_mock "OPEN" "some-human")"
   env \
     PATH="${mock_bin}:${PATH}" \
-    PR_URL="https://github.com/test-org/test-repo/pull/42" \
-    FULLSEND_FORGE="github" \
+    PR_URL="${pr_url}" \
+    FULLSEND_FORGE="${forge}" \
+    ${ci_server_host:+CI_SERVER_HOST="${ci_server_host}"} \
     REVIEW_TOKEN="" \
     PRIOR_REVIEW_FILE="${prior_file}" \
     PRIOR_REVIEW_PROVENANCE="app-verified" \
@@ -541,7 +549,13 @@ SECURITY_RECLASSIFICATION_THREADS='{"resolved_threads":[{"finding_id":"f_securit
 run_human_resolution_test "security-reclassification" \
   "${SECURITY_RECLASSIFICATION_PROJECTION}" \
   "${SECURITY_RECLASSIFICATION_THREADS}" \
-  '.findings[0].severity == "high" and .dispositions == [{"id":"f_security1","status":"reclassified"}]'
+  '.findings[0].severity == "high" and .dispositions == [{"id":"f_security1","status":"open"}]'
+
+run_human_resolution_test "gitlab-dismissal-stays-open" \
+  "${HUMAN_DISMISSAL_PROJECTION}" \
+  "${HUMAN_DISMISSAL_THREADS}" \
+  '.dispositions == [{"id":"f_human1","status":"open"}]' \
+  "gitlab"
 
 run_human_resolution_test "malformed-human-file-is-fail-open" \
   "${HUMAN_DISMISSAL_PROJECTION}" \
