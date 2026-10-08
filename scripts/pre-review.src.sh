@@ -238,9 +238,9 @@ fetch_human_dismissals() {
       | select(.comments_truncated == false)
       | .comments[]?
       | select(.author_type == "Bot")
-      | select(.author as $login | $trusted | index($login) != null)
+      | select(.author as $login | ($trusted | map(ascii_downcase) | index($login | ascii_downcase)) != null)
       | .body
-      | scan("finding:(f_[A-Za-z0-9]+)")
+      | scan("<!--[[:space:]]+finding:(f_[A-Za-z0-9]+)[[:space:]]+-->")
       | .[0]
     ] | unique
   ' <<< "${response}" 2>/dev/null || echo '[]'

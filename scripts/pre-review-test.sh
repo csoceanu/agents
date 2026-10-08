@@ -492,6 +492,12 @@ run_human_dismissal_test "verified-custom-app-resolver-closes-by-id" \
   '.dispositions == [{"id":"f_human1","status":"dismissed_by_human"}]' \
   "FULLSEND_APP_SET=custom"
 
+UPPERCASE_BOT_THREAD="$(jq -c '.threads[0].comments[0].author = "CUSTOM-REVIEW"' <<< "${VERIFIED_HUMAN_THREAD}")"
+run_human_dismissal_test "bot-identity-match-is-case-insensitive" \
+  "${HUMAN_PRIOR}" "${UPPERCASE_BOT_THREAD}" \
+  '.dispositions == [{"id":"f_human1","status":"dismissed_by_human"}]' \
+  "FULLSEND_APP_SET=custom"
+
 UNVERIFIED_HUMAN_THREAD="$(jq -c '.threads[0].resolved_by_role_verified = false' <<< "${VERIFIED_HUMAN_THREAD}")"
 run_human_dismissal_test "unverified-resolver-stays-open" \
   "${HUMAN_PRIOR}" "${UNVERIFIED_HUMAN_THREAD}" \
@@ -531,6 +537,12 @@ run_human_dismissal_test "high-finding-stays-open" \
 LEGACY_HUMAN_THREAD="$(jq -c '.threads[0].line = 4 | .threads[0].original_line = 3 | .threads[0].comments[0].body = "Naming nit."' <<< "${VERIFIED_HUMAN_THREAD}")"
 run_human_dismissal_test "legacy-unstamped-thread-stays-open" \
   "${HUMAN_PRIOR}" "${LEGACY_HUMAN_THREAD}" \
+  '.dispositions == [{"id":"f_human1","status":"open"}]' \
+  "FULLSEND_APP_SET=custom"
+
+QUOTED_HUMAN_THREAD="$(jq -c '.threads[0].comments[0].body = "Quoted text: finding:f_human1"' <<< "${VERIFIED_HUMAN_THREAD}")"
+run_human_dismissal_test "quoted-finding-id-without-marker-stays-open" \
+  "${HUMAN_PRIOR}" "${QUOTED_HUMAN_THREAD}" \
   '.dispositions == [{"id":"f_human1","status":"open"}]' \
   "FULLSEND_APP_SET=custom"
 
