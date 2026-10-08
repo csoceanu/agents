@@ -113,9 +113,10 @@ validate_prior_review_projection() {
     .version as $projection_version
     | if (
       type == "object" and
-      ((keys - ["version", "findings", "dispositions"]) | length == 0) and
+      ((keys - ["version", "action", "findings", "dispositions"]) | length == 0) and
       (.version | IN(1, 2)) and
       .version == $marker_version and
+      ((.action == null) or (.action | IN("approve", "request-changes", "comment", "reject"))) and
       (.findings | type == "array") and
       all(.findings[];
         type == "object" and
@@ -145,7 +146,8 @@ validate_prior_review_projection() {
         file: .file,
         line: .line
       } + (if .id == null then {} else {id: .id} end)]
-    } + (if .dispositions == null then {} else {
+    } + (if .action == null then {} else {action: .action} end)
+    + (if .dispositions == null then {} else {
       dispositions: [.dispositions[] | {id, status}]
     } end) else error("invalid prior review projection") end
   ' > "${tmp_file}"; then

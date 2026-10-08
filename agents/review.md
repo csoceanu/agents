@@ -97,6 +97,15 @@ findings equally. If filtering removes all findings from a
 `comment`. The severity threshold is absolute — it applies to all
 findings regardless of the `actionable` flag.
 
+On a verified re-review with a prior findings ledger, newly reported
+`info`/`low` findings must not produce a `request-changes` verdict or start the
+fix agent. If the prior verdict was `approve`, the host applies a temporary
+`medium` floor for the re-review, so low/info findings are omitted from the
+posted review. Otherwise, low/info findings may remain visible but do not
+block. Unresolved prior `medium`/`high`/`critical` findings remain blocking
+until they receive a valid disposition. This does not change the global
+severity threshold or treat a missing finding as resolved.
+
 ## Identity
 
 You **either**:

@@ -123,9 +123,13 @@ UNFILTERED_RESULT_FILE="${RESULT_FILE}"
 # being outside the latest diff. Ids are never derived from the path or text.
 # ---------------------------------------------------------------------------
 PRIOR_JSON='{"findings":[]}'
+HAS_VALID_PRIOR_REVIEW=false
+PRIOR_ACTION=""
 if [[ -n "${PRIOR_REVIEW_FILE:-}" && -f "${PRIOR_REVIEW_FILE}" ]]; then
   if parsed_prior="$(jq -ce 'select(type == "object" and (.findings | type) == "array")' "${PRIOR_REVIEW_FILE}" 2>/dev/null)"; then
     PRIOR_JSON="${parsed_prior}"
+    HAS_VALID_PRIOR_REVIEW=true
+    PRIOR_ACTION="$(jq -r '.action // empty' <<< "${PRIOR_JSON}")"
   fi
 fi
 # Mint one 16-hex-char id per current and prior finding (at least 128) from
@@ -267,7 +271,16 @@ severity_rank() {
   esac
 }
 
-threshold_rank=$(severity_rank "$REVIEW_FINDING_SEVERITY_THRESHOLD")
+EFFECTIVE_FINDING_SEVERITY_THRESHOLD="${REVIEW_FINDING_SEVERITY_THRESHOLD}"
+if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" && "${PRIOR_ACTION}" = "approve" ]]; then
+  # After an approval, keep only medium+ findings in the posted review. This
+  # is a per-re-review floor; the configured global default remains low.
+  if [[ "$(severity_rank "${REVIEW_FINDING_SEVERITY_THRESHOLD}")" -lt "$(severity_rank medium)" ]]; then
+    EFFECTIVE_FINDING_SEVERITY_THRESHOLD="medium"
+    echo "Prior review was approved — applying medium severity floor for this re-review"
+  fi
+fi
+threshold_rank=$(severity_rank "$EFFECTIVE_FINDING_SEVERITY_THRESHOLD")
 
 if jq -e '.findings' "${RESULT_FILE}" >/dev/null 2>&1; then
   original_count=$(jq '.findings | length' "${RESULT_FILE}")
@@ -286,7 +299,7 @@ if jq -e '.findings' "${RESULT_FILE}" >/dev/null 2>&1; then
   filtered_count=$(jq '.findings | length' "${FILTERED_RESULT}")
 
   if [ "${filtered_count}" -lt "${original_count}" ]; then
-    echo "Severity filter (threshold=${REVIEW_FINDING_SEVERITY_THRESHOLD}): kept ${filtered_count}/${original_count} findings"
+    echo "Severity filter (threshold=${EFFECTIVE_FINDING_SEVERITY_THRESHOLD}): kept ${filtered_count}/${original_count} findings"
     RESULT_FILE="${FILTERED_RESULT}"
 
     # If filtering removed all findings, delete the empty findings array
@@ -312,8 +325,45 @@ if jq -e '.findings' "${RESULT_FILE}" >/dev/null 2>&1; then
   fi
 fi
 
+# A severity filter can remove structured findings while leaving their prose
+# in the model-authored body. After an approval, rebuild the body from the
+# retained findings so low/info findings cannot leak back into the review.
+if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" && "${PRIOR_ACTION}" = "approve" ]] \
+    && [[ "$(jq -r '.action // empty' "${RESULT_FILE}")" != "failure" ]]; then
+  NORMALIZED_RESULT=$(mktemp)
+  CLEANUP_FILES+=("${NORMALIZED_RESULT}")
+  jq --arg threshold "${EFFECTIVE_FINDING_SEVERITY_THRESHOLD}" '
+    def finding_line:
+      "- **\(.severity)** \(.category) in \(.file // "PR-level")"
+      + (if (.line | type) == "number" then ":\(.line)" else "" end)
+      + (if (.description | type) == "string" and (.description | length) > 0 then " — \(.description)" else "" end)
+      + (if (.remediation | type) == "string" and (.remediation | length) > 0 then "\n  Remediation: \(.remediation)" else "" end);
+    .body = if ((.findings // []) | length) == 0 then
+      "Review completed; no findings at or above the configured \($threshold) severity threshold remain in the posted review."
+    else
+      "## Review findings\n\n" + ([.findings[] | finding_line] | join("\n"))
+    end
+  ' "${RESULT_FILE}" > "${NORMALIZED_RESULT}"
+  RESULT_FILE="${NORMALIZED_RESULT}"
+fi
+
 ACTION=$(jq -r '.action' "${RESULT_FILE}")
 # ACTION retains the original value for the entire script — not re-read after protected-path downgrade.
+
+# A re-review that may be promoted from a non-approval must pass the same
+# protected-path and risk gates as a direct approval. Temporarily run those
+# gates as an approval, then restore the original action until the ledger
+# decision below determines whether promotion is actually allowed.
+REREVIEW_SAFETY_CANDIDATE=false
+REREVIEW_ORIGINAL_ACTION="${ACTION}"
+REREVIEW_CURRENT_MEDIUM_PLUS_COUNT="$(jq -r '[.findings[]? | select(.severity | IN("medium", "high", "critical"))] | length' "${UNFILTERED_RESULT_FILE}")"
+if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]] \
+    && [[ "${REREVIEW_CURRENT_MEDIUM_PLUS_COUNT}" -eq 0 ]] \
+    && [[ "${ACTION}" = "request-changes" || "${ACTION}" = "reject" || \
+         ( "${ACTION}" = "comment" && "${PRIOR_ACTION}" = "approve" ) ]]; then
+  REREVIEW_SAFETY_CANDIDATE=true
+  ACTION="approve"
+fi
 
 # ---------------------------------------------------------------------------
 # Protected-path check: the review agent must not approve PRs that touch
@@ -571,6 +621,14 @@ if [ "${REVIEW_RISK_ASSESSMENT_ENABLED_RAW}" = "true" ]; then
       fi
     fi
 
+  fi
+fi
+
+if [[ "${REREVIEW_SAFETY_CANDIDATE}" = "true" ]]; then
+  if [[ "${DOWNGRADED}" = "true" ]]; then
+    ACTION="$(jq -r '.action // "comment"' "${RESULT_FILE}")"
+  else
+    ACTION="${REREVIEW_ORIGINAL_ACTION}"
   fi
 fi
 
@@ -889,6 +947,59 @@ if [[ -n "${BLOCKING_IDS}" && "${ACTION}" = "approve" ]]; then
   DOWNGRADED=true
 fi
 
+# Re-review severity gate. A verified prior ledger means this is a re-review;
+# do not let a newly discovered low/info finding start a fix run or block the
+# PR. Unresolved prior medium+ findings remain blocking. This is deliberately
+# separate from REVIEW_FINDING_SEVERITY_THRESHOLD: the global default remains
+# low, so first reviews still report low findings normally.
+PRIOR_MEDIUM_PLUS_OPEN_COUNT="$(jq -r --argjson effective "${LEDGER_EFFECTIVE}" '
+  [ .findings[]
+    | select(.severity | IN("medium", "high", "critical"))
+    | select(.id as $id | any($effective[]; .id == $id and .status == "open"))
+  ] | length
+' <<< "${PRIOR_LEDGER}")"
+CURRENT_MEDIUM_PLUS_COUNT="${REREVIEW_CURRENT_MEDIUM_PLUS_COUNT}"
+
+if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
+  if [[ ( "${ACTION}" = "request-changes" || "${ACTION}" = "reject" ) \
+      || ( "${ACTION}" = "comment" && "${PRIOR_ACTION}" = "approve" && "${DOWNGRADED}" = "false" ) ]] \
+      && [[ "${PRIOR_MEDIUM_PLUS_OPEN_COUNT}" -eq 0 ]] \
+      && [[ "${CURRENT_MEDIUM_PLUS_COUNT}" -eq 0 ]] \
+      && [[ "${DOWNGRADED}" = "false" ]]; then
+    echo "New findings on a re-review are low/info only — changing '${ACTION}' to 'approve'"
+    REREVIEW_RESULT=$(mktemp)
+    CLEANUP_FILES+=("${REREVIEW_RESULT}")
+    REREVIEW_NOTICE=$'\n\n> **Re-review note:** No medium-or-higher findings remain open. New low/info findings do not block this review or start a fix run.'
+    jq --arg notice "${REREVIEW_NOTICE}" --arg footer "${ACTION_HINTS_FOOTER:-}" \
+      '.action = "approve"
+       | .body = (((.body // "")
+           | if $footer == "" then . else (split($footer) | join("")) end)
+          + $notice)' \
+      "${RESULT_FILE}" > "${REREVIEW_RESULT}"
+    RESULT_FILE="${REREVIEW_RESULT}"
+    ACTION="approve"
+  elif [[ "${ACTION}" = "approve" || "${ACTION}" = "comment" ]] \
+      && [[ "${PRIOR_MEDIUM_PLUS_OPEN_COUNT}" -gt 0 ]] \
+      && { [[ "${DOWNGRADED}" = "false" ]] \
+        || [[ "${REREVIEW_SAFETY_CANDIDATE}" = "true" ]] \
+        || { [[ "${REREVIEW_ORIGINAL_ACTION}" = "approve" ]] && [[ -z "${BLOCKING_IDS}" ]]; }; }; then
+    echo "Unresolved prior medium+ findings remain — changing '${ACTION}' to 'request-changes'"
+    REREVIEW_RESULT=$(mktemp)
+    CLEANUP_FILES+=("${REREVIEW_RESULT}")
+    REREVIEW_NOTICE=$'\n\n> **Re-review note:** One or more prior medium-or-higher findings remain open and must still be addressed.'
+    if [[ -n "${ACTION_HINTS_FOOTER:-}" ]]; then
+      REREVIEW_FOOTER="${ACTION_HINTS_FOOTER}"
+    else
+      REREVIEW_FOOTER=$'\n\n---\n**Next steps:**\n- `/fs-fix` — agent addresses review findings automatically\n- `/fs-fix <your instruction>` — agent fixes with your specific guidance\n- Push commits directly — review re-runs automatically on push\n- `/fs-fix-stop` — disable automatic fix runs for this PR'
+    fi
+    jq --arg notice "${REREVIEW_NOTICE}" --arg footer "${REREVIEW_FOOTER}" \
+      '.action = "request-changes" | .body = ((.body // "") + $notice + $footer)' \
+      "${RESULT_FILE}" > "${REREVIEW_RESULT}"
+    RESULT_FILE="${REREVIEW_RESULT}"
+    ACTION="request-changes"
+  fi
+fi
+
 # Append a machine-readable projection only when every schema-validated finding
 # can be represented safely. A lossy projection could turn a failed sub-agent
 # into an apparently clean dimension on the next re-review. Low-severity
@@ -963,6 +1074,7 @@ PRIOR_FINDINGS_PROJECTION="$(jq -c --slurpfile unfiltered "${UNFILTERED_RESULT_F
       | ([ $carried_closed[].id ]) as $kept_closed
       | {
           version: 2,
+          action: .action,
           findings: ($current + $carried_open + $carried_closed)
         }
         + (if ($accounted | length) > 0 then

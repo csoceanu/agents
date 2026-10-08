@@ -128,6 +128,13 @@ verdict is downgraded to a comment (applying the `requires-manual-review` label)
 The severity threshold is absolute — it applies to all findings regardless of
 the `actionable` flag, respecting the user's configured threshold throughout.
 
+On a verified re-review with a prior findings ledger, newly reported
+`info`/`low` findings do not block the review or start a fix run. After a prior
+approval, the host applies a temporary `medium` floor so low/info findings are
+omitted from the posted review. Unresolved prior `medium`/`high`/`critical`
+findings remain blocking until they receive a valid disposition. This does not
+change the global severity threshold or treat a missing finding as resolved.
+
 ### GitLab host validation
 
 `gitlab-review-ops.lib.sh` validates `GITLAB_HOST` against `CI_SERVER_HOST`,
