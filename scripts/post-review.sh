@@ -303,6 +303,136 @@ forge_resolve_outdated_review_threads() {
   return 0
 }
 
+# --- Human dismissals ---
+
+# Print a JSON array of resolved review threads that can stand as a human
+# dismissal of a prior finding: resolved by a user who is not the PR author
+# and holds write, maintain, or admin on the repository. Bots and logins
+# that cannot be checked are never eligible. Each entry carries the thread
+# path and lines, whether the review agent itself commented in it, and any
+# finding ids stamped in the agent's comments (`finding:f_…` markers), so
+# the caller can match a thread to a ledger entry. Prints [] when nothing qualifies or any lookup fails: a dismissal
+# the runner cannot verify stays open.
+forge_get_human_dismissals() {
+  local owner name query cursor has_next page response page_nodes nodes_json
+  local pr_author login role candidates eligible
+  local -a gh_args
+
+  owner="${REPO%%/*}"
+  name="${REPO##*/}"
+  cursor=""
+  has_next="true"
+  page=0
+  nodes_json="[]"
+
+  # The author exclusion is only as good as the author lookup: without a
+  # known author nothing can be verified.
+  pr_author="$(forge_get_pr_author)"
+  if [[ -z "${pr_author}" ]]; then
+    echo "::warning::Could not determine the PR author — human dismissals cannot be verified" >&2
+    echo '[]'
+    return 0
+  fi
+
+  query='query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            isResolved
+            path
+            line
+            originalLine
+            resolvedBy { login }
+            comments(first: 100) {
+              pageInfo { hasNextPage }
+              nodes { body viewerDidAuthor }
+            }
+          }
+        }
+      }
+    }
+  }'
+
+  while [[ "${has_next}" == "true" ]]; do
+    page=$((page + 1))
+    if [[ "${page}" -gt 20 ]]; then
+      echo "::warning::Review thread pagination hit page cap — remaining threads not checked for dismissals" >&2
+      break
+    fi
+
+    gh_args=(api graphql
+      -f owner="${owner}"
+      -f name="${name}"
+      -F number="${PR_NUMBER}"
+      -f query="${query}")
+    if [[ -n "${cursor}" ]]; then
+      gh_args+=(-f cursor="${cursor}")
+    fi
+
+    if ! response=$(GH_TOKEN="${REVIEW_TOKEN}" gh "${gh_args[@]}" 2>/dev/null); then
+      echo "::warning::Failed to fetch review threads — human dismissals cannot be verified" >&2
+      echo '[]'
+      return 0
+    fi
+    if echo "${response}" | jq -e '.errors | type == "array" and length > 0' >/dev/null 2>&1; then
+      echo "::warning::Review thread query returned errors — human dismissals cannot be verified" >&2
+      echo '[]'
+      return 0
+    fi
+    page_nodes=$(echo "${response}" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || {
+      echo '[]'
+      return 0
+    }
+    nodes_json=$(jq -c --argjson page "${page_nodes}" '. + $page' <<< "${nodes_json}" 2>/dev/null) || {
+      echo '[]'
+      return 0
+    }
+    has_next=$(echo "${response}" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' 2>/dev/null) || has_next="false"
+    cursor=$(echo "${response}" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' 2>/dev/null) || cursor=""
+    if [[ "${has_next}" == "true" && -z "${cursor}" ]]; then
+      break
+    fi
+  done
+
+  # Resolved threads with a known resolver and complete comment pages. A
+  # finding id stamp counts only in a comment this token authored (the
+  # review agent's own), never in a reply anyone else wrote.
+  candidates=$(jq -c '
+    [ .[]
+      | select(type == "object")
+      | select(.isResolved == true)
+      | select((.resolvedBy.login // "") != "")
+      | select((.comments.pageInfo.hasNextPage // false) == false)
+      | {
+          path: .path,
+          line: .line,
+          original_line: .originalLine,
+          resolved_by: .resolvedBy.login,
+          agent_authored: ([ (.comments.nodes // [])[] | select(.viewerDidAuthor == true) ] | length > 0),
+          ids: ([ (.comments.nodes // [])[] | select(.viewerDidAuthor == true) | .body // "" | scan("finding:(f_[A-Za-z0-9]+)") | .[0] ] | unique)
+        }
+    ]' <<< "${nodes_json}" 2>/dev/null) || candidates="[]"
+
+  # Eligibility: not the PR author, a plain user login, and write or above
+  # on the repository. One permission lookup per distinct resolver.
+  eligible="[]"
+  while IFS= read -r login; do
+    [[ -z "${login}" ]] && continue
+    [[ "${login,,}" == "${pr_author,,}" ]] && continue
+    [[ "${login}" =~ ^[A-Za-z0-9-]+$ ]] || continue
+    role=$(GH_TOKEN="${REVIEW_TOKEN}" gh api "repos/${REPO}/collaborators/${login}/permission" \
+      --jq '.role_name' 2>/dev/null) || role=""
+    case "${role}" in
+      admin|maintain|write) eligible=$(jq -c --arg l "${login}" '. + [$l]' <<< "${eligible}") ;;
+      *) ;;
+    esac
+  done < <(jq -r '[.[].resolved_by] | unique | .[]' <<< "${candidates}" 2>/dev/null)
+
+  jq -c --argjson eligible "${eligible}" '[ .[] | select(.resolved_by as $l | $eligible | index($l) != null) ]' <<< "${candidates}" 2>/dev/null || echo '[]'
+}
+
 # --- Labels ---
 
 forge_add_label() {
@@ -555,6 +685,13 @@ forge_resolve_outdated_review_threads() {
 
 # --- Labels ---
 
+# Human dismissals need a resolved thread from a reviewer the runner can
+# vouch for. That check is not implemented for GitLab discussions, so no
+# dismissal is verified here and a dismissed_by_human disposition stays open.
+forge_get_human_dismissals() {
+  echo '[]'
+}
+
 forge_add_label() {
   local label="$1"
   if ! _gitlab_api PUT "/projects/${REPO_ENCODED}/merge_requests/${PR_NUMBER}" \
@@ -679,6 +816,128 @@ echo "Using result: ${RESULT_FILE}"
 # The severity filter below can drop an info-level sub-agent-failure. Keep the
 # unfiltered result so the projection still sees every failed dimension.
 UNFILTERED_RESULT_FILE="${RESULT_FILE}"
+
+# Assign ids on the unfiltered result so the ledger can keep a
+# reclassified row the severity filter later drops from the posted review.
+# ---------------------------------------------------------------------------
+# Finding ledger: stable ids and dispositions.
+#
+# Every finding carries an opaque id (f_ plus random hex). On a re-review the
+# prior ledger arrives as PRIOR_REVIEW_FILE, the JSON pre-review validated.
+# A prior id is OPEN when its last disposition is absent, open, or
+# reclassified, and CLOSED when it is resolved_by_change or
+# dismissed_by_human. Open ids must be answered by this review; closed ids
+# are carried forward unchanged, anchor and all, so a later review can
+# recognise the same finding and not raise it again. Nothing is dropped for
+# being outside the latest diff. Ids are never derived from the path or text.
+# ---------------------------------------------------------------------------
+PRIOR_JSON='{"findings":[]}'
+if [[ -n "${PRIOR_REVIEW_FILE:-}" && -f "${PRIOR_REVIEW_FILE}" ]]; then
+  if parsed_prior="$(jq -ce 'select(type == "object" and (.findings | type) == "array")' "${PRIOR_REVIEW_FILE}" 2>/dev/null)"; then
+    PRIOR_JSON="${parsed_prior}"
+  fi
+fi
+# Mint one 16-hex-char id per current and prior finding (at least 128) from
+# /dev/urandom so the pool can never run dry and abort the post.
+FINDING_COUNT="$(jq '.findings | if type == "array" then length else 0 end' "${RESULT_FILE}" 2>/dev/null || echo 0)"
+PRIOR_COUNT="$(jq '.findings | length' <<< "${PRIOR_JSON}")"
+MINT_COUNT=128
+if [[ "${FINDING_COUNT}" =~ ^[0-9]+$ && "${PRIOR_COUNT}" =~ ^[0-9]+$ ]] && (( FINDING_COUNT + PRIOR_COUNT > MINT_COUNT )); then
+  MINT_COUNT=$(( FINDING_COUNT + PRIOR_COUNT ))
+fi
+MINT_IDS="$(
+  od -An -N"$((MINT_COUNT * 8))" -tx1 /dev/urandom | tr -d ' \n' | fold -w16 | head -n "${MINT_COUNT}" | sed 's/^/f_/' \
+    | jq -R . | jq -sc .
+)"
+
+# Prior ledger: give legacy prior findings (written before ids existed) an id
+# so they enter the ledger instead of vanishing, and split prior ids into
+# open and closed. Minted ids used here are removed from the pool below.
+PRIOR_LEDGER="$(jq -c --argjson mints "${MINT_IDS}" '
+  def valid_id: type == "string" and test("^f_[A-Za-z0-9]+$");
+  def closed_status: IN("resolved_by_change", "dismissed_by_human");
+  ([ (.dispositions // [])[] | select(type == "object" and (.id | valid_id) and (.status | type == "string")) ]) as $disp
+  | (reduce (.findings // [])[] as $f ({findings: [], mint_i: 0};
+      if ($f.id | valid_id) then .findings += [$f]
+      else .findings += [$f + {id: $mints[.mint_i]}] | .mint_i += 1
+      end
+    )) as $r
+  | ($r.findings) as $fs
+  | {
+      findings: $fs,
+      closed: [ $fs[] | .id as $id | ($disp | map(select(.id == $id)) | last) as $d
+                | select($d != null and ($d.status | closed_status)) | . + {status: $d.status} ],
+      open_ids: [ $fs[] | .id as $id | ($disp | map(select(.id == $id)) | last) as $d
+                  | select($d == null or ($d.status | closed_status | not)) | .id ],
+      used_mints: $r.mint_i
+    }
+' <<< "${PRIOR_JSON}")"
+MINT_IDS="$(jq -c --argjson prior "${PRIOR_LEDGER}" '.[$prior.used_mints:]' <<< "${MINT_IDS}")"
+
+# Id assignment for this review. A supplied id is kept only when it is an
+# open prior id no earlier row already took and this review is not
+# resolving; a closed, resolving, foreign, or duplicate id is replaced (a
+# reclassified id must stay on its row, so it is kept). Without a usable id, copy the open prior id whose file and
+# category match: the exact line first, else the only candidate at that
+# place (a shifted line must not create a second ledger entry). Do not copy
+# an id this review is closing. A missing file (null or N/A) is not a
+# place, so those rows mint instead of inheriting. Otherwise mint.
+# Supplied open ids of later rows are reserved for them.
+if jq -e '.findings | type == "array"' "${RESULT_FILE}" >/dev/null 2>&1; then
+  ID_RESULT="$(mktemp)"
+  CLEANUP_FILES+=("${ID_RESULT}")
+  jq --argjson prior "${PRIOR_LEDGER}" --argjson mints "${MINT_IDS}" '
+    def valid_id: type == "string" and test("^f_[A-Za-z0-9]+$");
+    def anchor_line: if type == "number" then . else null end;
+    def anchor_file: if . == "N/A" or . == null then null else . end;
+    def closed_status: IN("resolved_by_change", "dismissed_by_human");
+    def resolving:
+      (.status | closed_status)
+      and (.rationale | type == "string" and length > 0)
+      and (.evidence | type == "string" and length > 0);
+    def reclassified:
+      .status == "reclassified"
+      and (.rationale | type == "string" and length > 0)
+      and (.evidence | type == "string" and length > 0);
+    ($prior.open_ids) as $open
+    | ([ (.dispositions // [])[] | select(resolving or reclassified) | .id | select(valid_id) ]) as $closing
+    | ([ (.dispositions // [])[] | select(resolving) | .id | select(valid_id) ]) as $resolving_ids
+    | ([ $prior.findings[] | select(.id as $pid | $open | index($pid) != null) ]) as $open_findings
+    | (.findings // []) as $rows
+    | .findings = (
+        reduce range(0; ($rows | length)) as $i (
+          {done: [], mint_i: 0};
+          . as $state
+          | $rows[$i] as $f
+          | ([ $state.done[].id ]) as $taken
+          | (
+              if ($f.id | valid_id) and ($open | index($f.id)) != null and ($taken | index($f.id)) == null
+                 and ($resolving_ids | index($f.id)) == null
+              then {id: $f.id, mint_i: $state.mint_i}
+              else
+                ([ $rows[($i + 1):][] | .id | select(valid_id) | select(. as $x | $open | index($x) != null) ]) as $reserved
+                | ([ $open_findings[]
+                     | select(.id as $pid | ($taken + $reserved + $closing) | index($pid) == null)
+                     | select((.file | anchor_file) != null and ($f.file | anchor_file) != null)
+                     | select((.file | anchor_file) == ($f.file | anchor_file) and .category == $f.category)
+                   ]) as $same_place
+                | ([ $same_place[] | select((.line | anchor_line) == ($f.line | anchor_line)) ]) as $exact
+                | if ($exact | length) == 1 then {id: $exact[0].id, mint_i: $state.mint_i}
+                  elif ($same_place | length) == 1 then {id: $same_place[0].id, mint_i: $state.mint_i}
+                  elif ($mints[$state.mint_i] | valid_id | not) then error("ran out of finding ids")
+                  else {id: $mints[$state.mint_i], mint_i: ($state.mint_i + 1)}
+                  end
+              end
+            ) as $picked
+          | .done += [$f + {id: $picked.id}]
+          | .mint_i = $picked.mint_i
+        )
+        | .done
+      )
+  ' "${RESULT_FILE}" > "${ID_RESULT}"
+  mv "${ID_RESULT}" "${RESULT_FILE}"
+fi
+
 
 # ---------------------------------------------------------------------------
 # Severity filtering: drop findings below the configured threshold.
@@ -1212,13 +1471,148 @@ else
   remove_stale_risk_labels
 fi
 
+
+# Human dismissals are the runner's to verify, not the model's to assert:
+# a dismissed_by_human disposition counts only against a resolved review
+# thread from an eligible reviewer (not the PR author, write or above).
+# Fetched once, and only when the model used that status.
+HUMAN_DISMISSALS='[]'
+if jq -e '[.dispositions[]? | select(type == "object" and .status == "dismissed_by_human")] | length > 0' "${RESULT_FILE}" >/dev/null 2>&1; then
+  HUMAN_DISMISSALS="$(forge_get_human_dismissals)" || HUMAN_DISMISSALS='[]'
+  if ! jq -e 'type == "array"' <<< "${HUMAN_DISMISSALS}" >/dev/null 2>&1; then
+    HUMAN_DISMISSALS='[]'
+  fi
+fi
+
+# Ledger accounting. Each open prior id gets one effective status, decided
+# here and used by both the approval guard and the projection:
+#   resolved_by_change  — rationale and evidence given.
+#   reclassified        — rationale and evidence given, and this review
+#                         re-emits a finding with the same id (at its new
+#                         severity or category, below threshold or not).
+#                         Without that finding the id stays open: nothing
+#                         else carries the new classification.
+#   dismissed_by_human  — rationale and evidence given, the prior finding is
+#                         not high or critical, and a verified dismissal
+#                         thread matches it: by stamped id, or an unstamped
+#                         thread at the one open finding's file and line.
+#   open                — everything else, including a disposition aimed at
+#                         a closed id (a human dismissal or a recorded fix is
+#                         not the model's to undo).
+# A prior high or critical id still open blocks an approval unless this
+# review re-emits it at high or critical: absent, or re-emitted lower with
+# no supported reclassification, is not a fix.
+LEDGER_REPORT="$(jq -c --argjson prior "${PRIOR_LEDGER}" --argjson dismissals "${HUMAN_DISMISSALS}" --slurpfile unfiltered "${UNFILTERED_RESULT_FILE}" '
+  def valid_id: type == "string" and test("^f_[A-Za-z0-9]+$");
+  def nonempty: type == "string" and length > 0;
+  def well_formed_disposition:
+    type == "object"
+    and (.id | valid_id)
+    and (.status | IN("open", "resolved_by_change", "reclassified", "dismissed_by_human"))
+    and (.rationale | type == "string")
+    and (.evidence | type == "string");
+  def supported: (.rationale | nonempty) and (.evidence | nonempty);
+  def dismissal_verified($f):
+    # A thread stamped with finding ids binds only to those ids. An
+    # unstamped thread the review agent commented in binds by file and
+    # line, and only when exactly one open prior finding sits there. A
+    # thread with no agent comment is not about any finding.
+    any($dismissals[]?;
+      if ((.ids // []) | length) > 0 then (.ids | index($f.id) != null)
+      else (.agent_authored == true)
+        and (.path | type == "string") and .path == $f.file
+        and ($f.line | type == "number")
+        and (.line == $f.line or .original_line == $f.line)
+        and ([ $prior.findings[]
+               | select(.id as $pid | $prior.open_ids | index($pid) != null)
+               | select(.file == $f.file and .line == $f.line) ] | length) == 1
+      end);
+  ($prior.open_ids) as $open
+  | ([ $prior.closed[].id ]) as $closed
+  | ([ (.dispositions // [])[] | select(well_formed_disposition) ]) as $given
+  | ([ ($unfiltered[0].findings // [])[] | .id | select(valid_id) ]) as $current_ids
+  | ([
+      $open[]
+      | . as $id
+      | (($prior.findings | map(select(.id == $id)) | first) // {id: $id}) as $f
+      | ($given | map(select(.id == $id)) | last) as $got
+      | if $got == null then {id: $id, status: "open", why: "unanswered"}
+        elif $got.status == "resolved_by_change" and ($got | supported) then {id: $id, status: "resolved_by_change"}
+        elif $got.status == "reclassified" and ($got | supported) then
+          if ($current_ids | index($id)) != null then {id: $id, status: "reclassified"}
+          else {id: $id, status: "open", why: "reclassified-without-finding"} end
+        elif $got.status == "dismissed_by_human" and ($got | supported) then
+          if ($f.severity | IN("high", "critical")) then {id: $id, status: "open", why: "dismissed-high"}
+          elif dismissal_verified($f) then {id: $id, status: "dismissed_by_human"}
+          else {id: $id, status: "open", why: "dismissed-unverified"} end
+        else {id: $id, status: "open"}
+        end
+    ]) as $effective
+  | ([ $effective[] | select(.status == "open") | .id ]) as $still_open
+  | {
+      effective: [ $effective[] | {id, status} ],
+      unanswered: [ $effective[] | select(.why == "unanswered") | .id ],
+      reclassified_without_finding: [ $effective[] | select(.why == "reclassified-without-finding") | .id ],
+      dismissed_high: [ $effective[] | select(.why == "dismissed-high") | .id ],
+      dismissed_unverified: [ $effective[] | select(.why == "dismissed-unverified") | .id ],
+      blocking: [ $prior.findings[]
+                  | select(.severity | IN("high", "critical"))
+                  | select(.id as $id | $still_open | index($id) != null)
+                  | .id ],
+      ignored_closed: [ (.dispositions // [])[] | select(type == "object") | .id
+                        | select(type == "string") | select(. as $id | $closed | index($id) != null) ] | unique
+    }
+' "${RESULT_FILE}")"
+LEDGER_EFFECTIVE="$(jq -c '.effective' <<< "${LEDGER_REPORT}")"
+UNANSWERED_IDS="$(jq -r '.unanswered | join(", ")' <<< "${LEDGER_REPORT}")"
+if [[ -n "${UNANSWERED_IDS}" ]]; then
+  echo "::warning::No disposition recorded for prior finding id(s) ${UNANSWERED_IDS}; recorded as open"
+fi
+RECLASSIFIED_WITHOUT_FINDING_IDS="$(jq -r '.reclassified_without_finding | join(", ")' <<< "${LEDGER_REPORT}")"
+if [[ -n "${RECLASSIFIED_WITHOUT_FINDING_IDS}" ]]; then
+  echo "::warning::Reclassified prior finding id(s) ${RECLASSIFIED_WITHOUT_FINDING_IDS} have no current finding with that id; recorded as open"
+fi
+DISMISSED_HIGH_IDS="$(jq -r '.dismissed_high | join(", ")' <<< "${LEDGER_REPORT}")"
+if [[ -n "${DISMISSED_HIGH_IDS}" ]]; then
+  echo "::warning::dismissed_by_human is not accepted for high or critical prior finding id(s) ${DISMISSED_HIGH_IDS}; recorded as open"
+fi
+DISMISSED_UNVERIFIED_IDS="$(jq -r '.dismissed_unverified | join(", ")' <<< "${LEDGER_REPORT}")"
+if [[ -n "${DISMISSED_UNVERIFIED_IDS}" ]]; then
+  echo "::warning::No resolved review thread from an eligible reviewer matches dismissed prior finding id(s) ${DISMISSED_UNVERIFIED_IDS}; recorded as open"
+fi
+IGNORED_CLOSED_IDS="$(jq -r '.ignored_closed | join(", ")' <<< "${LEDGER_REPORT}")"
+if [[ -n "${IGNORED_CLOSED_IDS}" ]]; then
+  echo "::warning::Ignoring disposition for closed prior finding id(s) ${IGNORED_CLOSED_IDS}; a resolved or human-dismissed finding stays closed"
+fi
+BLOCKING_IDS="$(jq -r '.blocking | join(", ")' <<< "${LEDGER_REPORT}")"
+if [[ -n "${BLOCKING_IDS}" && "${ACTION}" = "approve" ]]; then
+  echo "::warning::Approval withheld: prior high/critical finding id(s) ${BLOCKING_IDS} are still open"
+  LEDGER_NOTICE=$'\n\n> **Note:** Approval withheld. Earlier high or critical finding(s) '"${BLOCKING_IDS}"$' are still open.'
+  LEDGER_RESULT="$(mktemp)"
+  CLEANUP_FILES+=("${LEDGER_RESULT}")
+  jq --arg notice "${LEDGER_NOTICE}" \
+    '.action = "comment" | .body = (.body + $notice)' \
+    "${RESULT_FILE}" > "${LEDGER_RESULT}"
+  RESULT_FILE="${LEDGER_RESULT}"
+  ACTION="comment"
+  DOWNGRADED=true
+fi
+
 # Append a machine-readable projection only when every schema-validated finding
 # can be represented safely. A lossy projection could turn a failed sub-agent
 # into an apparently clean dimension on the next re-review. Low-severity
 # challenger failures are non-dimensional and retain the pre-challenger findings.
 # A dimension failure the severity filter removed (Sonnet-tier failures are
 # recorded at info) must still suppress the projection.
-PRIOR_FINDINGS_PROJECTION="$(jq -c --slurpfile unfiltered "${UNFILTERED_RESULT_FILE}" '
+#
+# The projection is the ledger: every current finding plus every prior
+# finding not re-emitted, each with its id, and one {id, status} per prior
+# id. A prior id whose disposition stays open keeps its prior severity and
+# category; only a supported reclassification changes them. Closed
+# findings keep their anchor so the next review can recognise
+# them; the oldest closed entries are dropped past 100. Rationale and
+# evidence stay in the human-readable comment and never enter the marker.
+PRIOR_FINDINGS_PROJECTION="$(jq -c --slurpfile unfiltered "${UNFILTERED_RESULT_FILE}" --argjson prior "${PRIOR_LEDGER}" --argjson effective "${LEDGER_EFFECTIVE}" '
   def allowed_category:
     IN(
       "logic-error", "nil-deref", "off-by-one", "edge-case", "api-contract", "missing-test", "test-inadequate", "pattern-violation", "test-weakened", "test-removed", "mock-loosened", "assertion-weakened", "coverage-reduced", "test-poisoning", "split-payload", "stale-reference",
@@ -1241,21 +1635,48 @@ PRIOR_FINDINGS_PROJECTION="$(jq -c --slurpfile unfiltered "${UNFILTERED_RESULT_F
     (.category == "sub-agent-failure" and .severity == "low");
   def projectable:
     (.category | type == "string" and allowed_category) and (.file == "N/A" or (.file | safe_path));
+  def closed_status: IN("resolved_by_change", "dismissed_by_human");
+  def project_finding:
+    {
+      severity,
+      category,
+      file: (if .file == "N/A" then null else .file end),
+      id
+    } + (if (.line | type) == "number" then {line} else {} end);
+  def is_closed($accounted; $id):
+    [$accounted[] | select(.id == $id and (.status | closed_status))] | length > 0;
   (.findings // []) as $findings
   | ($findings | map(select(non_dimensional_finding | not))) as $dimension_findings
   | (($unfiltered[0].findings // [])
       | any(.[]; .category == "sub-agent-failure" and (non_dimensional_finding | not))) as $dimension_failed
+  | (($unfiltered[0].findings // []) | map(select((non_dimensional_finding | not) and projectable))) as $ledger_findings
   | if (.action | IN("approve", "request-changes", "comment", "reject"))
       and ($dimension_findings | all(.[]; projectable))
       and ($dimension_failed | not) then
-      {
-        version: 2,
-        findings: [
-          $dimension_findings[]
-          | {severity, category, file: (if .file == "N/A" then null else .file end)}
-            + (if (.line | type) == "number" then {line} else {} end)
-        ]
-      }
+      ($effective) as $answered
+      | ([ $prior.closed[] | {id, status} ]) as $carried
+      | ($answered + $carried) as $accounted
+      | ([ $ledger_findings[] | select(is_closed($accounted; .id) | not)
+           | . as $row
+           | (($prior.findings | map(select(.id == $row.id)) | first) // null) as $p
+           | (($answered | map(select(.id == $row.id)) | first) // null) as $a
+           | if $p != null and $a != null and $a.status == "open"
+             then $row + {severity: $p.severity, category: $p.category} else $row end
+           | project_finding ]) as $current
+      | ([ $current[].id ]) as $current_ids
+      | ([ $prior.findings[] | select(.id as $id | $current_ids | index($id) == null) | project_finding ]) as $carried_findings
+      | ([ $carried_findings[] | select(is_closed($accounted; .id) | not) ]) as $carried_open
+      | ([ $prior.closed[] | select(.id as $id | $current_ids | index($id) == null) | project_finding ]) as $older_closed
+      | ([ $carried_findings[] | select(is_closed($accounted; .id)) | select(.id as $id | [$prior.closed[].id] | index($id) == null) ]) as $newly_closed
+      | ($older_closed + $newly_closed | if length > 100 then .[(length - 100):] else . end) as $carried_closed
+      | ([ $carried_closed[].id ]) as $kept_closed
+      | {
+          version: 2,
+          findings: ($current + $carried_open + $carried_closed)
+        }
+        + (if ($accounted | length) > 0 then
+             {dispositions: [ $accounted[] | select((.status | closed_status | not) or (.id as $id | $kept_closed | index($id) != null)) ]}
+           else {} end)
     else empty
     end
 ' "${RESULT_FILE}")"
@@ -1281,7 +1702,9 @@ jq --arg marker "${PROJECTION_MARKER}" '
     if (.body | type) == "string" then .body else "" end
     | strip_reserved_fixpoint
   )
-  | if $marker == "" then . else .body = (.body + "\n\n" + $marker) end
+  # The marker leads the body: sticky truncation cuts from the end, so a
+  # very long review must never lose its ledger.
+  | if $marker == "" then . else .body = ($marker + "\n\n" + .body) end
 ' \
   "${RESULT_FILE}" > "${TMP_RESULT}"
 mv "${TMP_RESULT}" "${RESULT_FILE}"

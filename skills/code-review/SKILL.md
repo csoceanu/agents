@@ -264,6 +264,11 @@ skill):
   since the prior review SHA: severity may be re-evaluated normally.
 - **New findings:** For findings with no prior match: assess severity
   normally.
+- **Ids and closed records:** A matched prior record that carries an `id`
+  keeps it: copy the id onto the finding, never invent or derive one. A
+  prior record whose status is `resolved_by_change` or `dismissed_by_human`
+  is closed and is not re-raised at that anchor; a defect that is present
+  again in the current code is a new finding with no id.
 
 When prior review context is NOT available (first review): assess all
 findings normally.

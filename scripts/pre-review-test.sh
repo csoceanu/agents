@@ -284,7 +284,15 @@ run_prior_projection_test() {
     echo "PASS: ${test_name}"
     return
   fi
-  if ! jq -e --argjson expected "${expected_json}" '. == $expected' "${prior_file}" >/dev/null 2>&1; then
+  if ! jq -e --argjson expected "${expected_json}" '
+    def valid_id: type == "string" and test("^f_[A-Za-z0-9]+$");
+    (.findings | length) == ($expected.findings | length) and
+    (.findings | all(has("id") and (.id | valid_id))) and
+    ((. | del(.findings)) == ($expected | del(.findings))) and
+    ([range(0; .findings | length) as $i
+      | .findings[$i] as $a | $expected.findings[$i] as $e
+      | if ($e | has("id")) then $a == $e else ($a | del(.id)) == $e end] | all)
+  ' "${prior_file}" >/dev/null 2>&1; then
     echo "FAIL: ${test_name} — canonical prior projection mismatch"
     cat "${prior_file}"
     FAILURES=$((FAILURES + 1))
@@ -414,6 +422,51 @@ done
 UNKNOWN_CATEGORY='{"version":1,"findings":[{"severity":"low","category":"made-up","file":"safe.go"}]}'
 run_prior_projection_test "unknown-category-fails-closed" \
   "$(projection_marker "${UNKNOWN_CATEGORY}")" \
+  "app-verified" \
+  'EMPTY'
+
+V2_ID_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123"},{"severity":"high","category":"logic-error","file":"internal/bar.go","line":2,"id":"f_closed1"}],"dispositions":[{"id":"f_abc123","status":"open"},{"id":"f_closed1","status":"dismissed_by_human"}]}'
+run_prior_projection_test "v2-id-and-disposition-retained" \
+  "$(projection_marker "${V2_ID_PROJECTION}")" \
+  "app-verified" \
+  "${V2_ID_PROJECTION}"
+
+# Legacy projections without ids receive one before the sandbox, so the
+# agent can write a disposition on the first re-review after upgrade.
+run_prior_projection_test "legacy-findings-get-minted-ids" \
+  "$(projection_marker "${VALID_PROJECTION}")" \
+  "app-verified" \
+  "${VALID_PROJECTION}"
+
+# Dispositions carry structured metadata only. Free text from an earlier
+# review (rationale, evidence) must never reach the sandbox.
+FREE_TEXT_DISPOSITION_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123"}],"dispositions":[{"id":"f_abc123","status":"open","rationale":"Still present.","evidence":""}]}'
+run_prior_projection_test "disposition-free-text-fails-closed" \
+  "$(projection_marker "${FREE_TEXT_DISPOSITION_PROJECTION}")" \
+  "app-verified" \
+  'EMPTY'
+
+DUPLICATE_ID_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123"},{"severity":"low","category":"logic-error","file":"internal/bar.go","line":9,"id":"f_abc123"}]}'
+run_prior_projection_test "duplicate-finding-id-fails-closed" \
+  "$(projection_marker "${DUPLICATE_ID_PROJECTION}")" \
+  "app-verified" \
+  'EMPTY'
+
+DUPLICATE_DISPOSITION_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123"}],"dispositions":[{"id":"f_abc123","status":"open"},{"id":"f_abc123","status":"resolved_by_change"}]}'
+run_prior_projection_test "duplicate-disposition-id-fails-closed" \
+  "$(projection_marker "${DUPLICATE_DISPOSITION_PROJECTION}")" \
+  "app-verified" \
+  'EMPTY'
+
+BAD_ID_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"not-an-id"}]}'
+run_prior_projection_test "invalid-finding-id-fails-closed" \
+  "$(projection_marker "${BAD_ID_PROJECTION}")" \
+  "app-verified" \
+  'EMPTY'
+
+BAD_DISPOSITION_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123"}],"dispositions":[{"id":"f_abc123","status":"wontfix"}]}'
+run_prior_projection_test "invalid-disposition-fails-closed" \
+  "$(projection_marker "${BAD_DISPOSITION_PROJECTION}")" \
   "app-verified" \
   'EMPTY'
 

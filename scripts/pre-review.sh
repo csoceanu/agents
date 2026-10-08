@@ -287,6 +287,136 @@ forge_resolve_outdated_review_threads() {
   return 0
 }
 
+# --- Human dismissals ---
+
+# Print a JSON array of resolved review threads that can stand as a human
+# dismissal of a prior finding: resolved by a user who is not the PR author
+# and holds write, maintain, or admin on the repository. Bots and logins
+# that cannot be checked are never eligible. Each entry carries the thread
+# path and lines, whether the review agent itself commented in it, and any
+# finding ids stamped in the agent's comments (`finding:f_…` markers), so
+# the caller can match a thread to a ledger entry. Prints [] when nothing qualifies or any lookup fails: a dismissal
+# the runner cannot verify stays open.
+forge_get_human_dismissals() {
+  local owner name query cursor has_next page response page_nodes nodes_json
+  local pr_author login role candidates eligible
+  local -a gh_args
+
+  owner="${REPO%%/*}"
+  name="${REPO##*/}"
+  cursor=""
+  has_next="true"
+  page=0
+  nodes_json="[]"
+
+  # The author exclusion is only as good as the author lookup: without a
+  # known author nothing can be verified.
+  pr_author="$(forge_get_pr_author)"
+  if [[ -z "${pr_author}" ]]; then
+    echo "::warning::Could not determine the PR author — human dismissals cannot be verified" >&2
+    echo '[]'
+    return 0
+  fi
+
+  query='query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            isResolved
+            path
+            line
+            originalLine
+            resolvedBy { login }
+            comments(first: 100) {
+              pageInfo { hasNextPage }
+              nodes { body viewerDidAuthor }
+            }
+          }
+        }
+      }
+    }
+  }'
+
+  while [[ "${has_next}" == "true" ]]; do
+    page=$((page + 1))
+    if [[ "${page}" -gt 20 ]]; then
+      echo "::warning::Review thread pagination hit page cap — remaining threads not checked for dismissals" >&2
+      break
+    fi
+
+    gh_args=(api graphql
+      -f owner="${owner}"
+      -f name="${name}"
+      -F number="${PR_NUMBER}"
+      -f query="${query}")
+    if [[ -n "${cursor}" ]]; then
+      gh_args+=(-f cursor="${cursor}")
+    fi
+
+    if ! response=$(GH_TOKEN="${REVIEW_TOKEN}" gh "${gh_args[@]}" 2>/dev/null); then
+      echo "::warning::Failed to fetch review threads — human dismissals cannot be verified" >&2
+      echo '[]'
+      return 0
+    fi
+    if echo "${response}" | jq -e '.errors | type == "array" and length > 0' >/dev/null 2>&1; then
+      echo "::warning::Review thread query returned errors — human dismissals cannot be verified" >&2
+      echo '[]'
+      return 0
+    fi
+    page_nodes=$(echo "${response}" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || {
+      echo '[]'
+      return 0
+    }
+    nodes_json=$(jq -c --argjson page "${page_nodes}" '. + $page' <<< "${nodes_json}" 2>/dev/null) || {
+      echo '[]'
+      return 0
+    }
+    has_next=$(echo "${response}" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' 2>/dev/null) || has_next="false"
+    cursor=$(echo "${response}" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' 2>/dev/null) || cursor=""
+    if [[ "${has_next}" == "true" && -z "${cursor}" ]]; then
+      break
+    fi
+  done
+
+  # Resolved threads with a known resolver and complete comment pages. A
+  # finding id stamp counts only in a comment this token authored (the
+  # review agent's own), never in a reply anyone else wrote.
+  candidates=$(jq -c '
+    [ .[]
+      | select(type == "object")
+      | select(.isResolved == true)
+      | select((.resolvedBy.login // "") != "")
+      | select((.comments.pageInfo.hasNextPage // false) == false)
+      | {
+          path: .path,
+          line: .line,
+          original_line: .originalLine,
+          resolved_by: .resolvedBy.login,
+          agent_authored: ([ (.comments.nodes // [])[] | select(.viewerDidAuthor == true) ] | length > 0),
+          ids: ([ (.comments.nodes // [])[] | select(.viewerDidAuthor == true) | .body // "" | scan("finding:(f_[A-Za-z0-9]+)") | .[0] ] | unique)
+        }
+    ]' <<< "${nodes_json}" 2>/dev/null) || candidates="[]"
+
+  # Eligibility: not the PR author, a plain user login, and write or above
+  # on the repository. One permission lookup per distinct resolver.
+  eligible="[]"
+  while IFS= read -r login; do
+    [[ -z "${login}" ]] && continue
+    [[ "${login,,}" == "${pr_author,,}" ]] && continue
+    [[ "${login}" =~ ^[A-Za-z0-9-]+$ ]] || continue
+    role=$(GH_TOKEN="${REVIEW_TOKEN}" gh api "repos/${REPO}/collaborators/${login}/permission" \
+      --jq '.role_name' 2>/dev/null) || role=""
+    case "${role}" in
+      admin|maintain|write) eligible=$(jq -c --arg l "${login}" '. + [$l]' <<< "${eligible}") ;;
+      *) ;;
+    esac
+  done < <(jq -r '[.[].resolved_by] | unique | .[]' <<< "${candidates}" 2>/dev/null)
+
+  jq -c --argjson eligible "${eligible}" '[ .[] | select(.resolved_by as $l | $eligible | index($l) != null) ]' <<< "${candidates}" 2>/dev/null || echo '[]'
+}
+
 # --- Labels ---
 
 forge_add_label() {
@@ -539,6 +669,13 @@ forge_resolve_outdated_review_threads() {
 
 # --- Labels ---
 
+# Human dismissals need a resolved thread from a reviewer the runner can
+# vouch for. That check is not implemented for GitLab discussions, so no
+# dismissal is verified here and a dismissed_by_human disposition stays open.
+forge_get_human_dismissals() {
+  echo '[]'
+}
+
 forge_add_label() {
   local label="$1"
   if ! _gitlab_api PUT "/projects/${REPO_ENCODED}/merge_requests/${PR_NUMBER}" \
@@ -603,6 +740,39 @@ echo "  PR_NUMBER=${PR_NUMBER}"
 echo "  REPO=${REPO}"
 echo "  PR_URL=${PR_URL}"
 
+# Assign opaque ids to prior findings that predate the ledger, before the
+# sandbox reads this file. Same mint as post-review: f_ plus 16 hex chars
+# from /dev/urandom. Existing valid ids are left alone.
+mint_missing_prior_ids() {
+  local prior_file="$1"
+  local missing mint_ids tmp
+  missing="$(jq '[.findings[] | select(.id == null)] | length' "${prior_file}")"
+  if [[ ! "${missing}" =~ ^[1-9][0-9]*$ ]]; then
+    return 0
+  fi
+  mint_ids="$(
+    od -An -N"$((missing * 8))" -tx1 /dev/urandom | tr -d ' \n' | fold -w16 | head -n "${missing}" | sed 's/^/f_/' \
+      | jq -R . | jq -sc .
+  )"
+  tmp="$(mktemp "${prior_file}.mint.XXXXXX")"
+  if jq -ce --argjson mints "${mint_ids}" '
+    def valid_id: type == "string" and test("^f_[A-Za-z0-9]+$");
+    .findings = (
+      reduce .findings[] as $f ({out:[], i:0};
+        if ($f.id | valid_id) then .out += [$f]
+        elif ($mints[.i] | valid_id | not) then error("ran out of finding ids")
+        else .out += [$f + {id: $mints[.i]}] | .i += 1
+        end
+      ) | .out
+    )
+  ' "${prior_file}" > "${tmp}"; then
+    mv "${tmp}" "${prior_file}"
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Replace the human-readable sticky review with a mechanically validated,
 # structured projection before host_files copies it into the sandbox. The
@@ -652,18 +822,30 @@ validate_prior_review_projection() {
     .version as $projection_version
     | if (
       type == "object" and
-      ((keys - ["version", "findings"]) | length == 0) and
+      ((keys - ["version", "findings", "dispositions"]) | length == 0) and
       (.version | IN(1, 2)) and
       .version == $marker_version and
       (.findings | type == "array") and
       all(.findings[];
         type == "object" and
-        ((keys - ["severity", "category", "file", "line"]) | length == 0) and
+        ((keys - ["severity", "category", "file", "line", "id"]) | length == 0) and
         (.severity | IN("info", "low", "medium", "high", "critical")) and
         (.category | type == "string" and allowed_category) and
         ((.file == null and $projection_version == 2) or (.file | safe_path)) and
-        (.line == null or (.line | type == "number" and . > 0 and floor == .))
-      )
+        (.line == null or (.line | type == "number" and . > 0 and floor == .)) and
+        (.id == null or (.id | type == "string" and test("^f_[A-Za-z0-9]+$")))
+      ) and
+      ([.findings[].id | select(. != null)] | length == (unique | length)) and
+      (.dispositions == null or (
+        (.dispositions | type == "array") and
+        all(.dispositions[];
+          type == "object" and
+          ((keys - ["id", "status"]) | length == 0) and
+          (.id | type == "string" and test("^f_[A-Za-z0-9]+$")) and
+          (.status | IN("open", "resolved_by_change", "reclassified", "dismissed_by_human"))
+        ) and
+        ([.dispositions[].id] | length == (unique | length))
+      ))
     ) then {
       version: $projection_version,
       findings: [.findings[] | {
@@ -671,11 +853,21 @@ validate_prior_review_projection() {
         category: .category,
         file: .file,
         line: .line
-      }]
-    } else error("invalid prior review projection") end
+      } + (if .id == null then {} else {id: .id} end)]
+    } + (if .dispositions == null then {} else {
+      dispositions: [.dispositions[] | {id, status}]
+    } end) else error("invalid prior review projection") end
   ' > "${tmp_file}"; then
-    mv "${tmp_file}" "${prior_file}"
-    echo "Prior review projection validated"
+    # Legacy findings (v1 / v2 without id) get an opaque id before the
+    # sandbox so this review can write a disposition for them.
+    if mint_missing_prior_ids "${tmp_file}"; then
+      mv "${tmp_file}" "${prior_file}"
+      echo "Prior review projection validated"
+    else
+      : > "${prior_file}"
+      rm -f "${tmp_file}"
+      echo "::warning::Prior review projection rejected — using full first-review dispatch"
+    fi
   else
     : > "${prior_file}"
     rm -f "${tmp_file}"

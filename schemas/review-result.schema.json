@@ -24,6 +24,11 @@
       "type": "string",
       "enum": ["tool-failure", "missing-context", "ambiguous-findings", "token-limit", "time-budget"]
     },
+    "dispositions": {
+      "type": "array",
+      "description": "One entry for every open finding id from the prior projection (status absent, open, or reclassified). Ids already resolved or dismissed by a human are closed and must not be answered. A reclassified entry needs a finding with the same id in findings; a dismissed_by_human entry is accepted only when the post-script verifies a resolved review thread from an eligible reviewer, and never for a high or critical finding. Omit on a first review.",
+      "items": { "$ref": "#/$defs/disposition" }
+    },
     "label_actions": {
       "$ref": "#/$defs/label_actions"
     },
@@ -121,6 +126,28 @@
         "actionable": {
           "type": "boolean",
           "description": "When true with a non-empty remediation, routes the verdict to request-changes so the fix agent can address the finding automatically."
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^f_[a-zA-Z0-9]+$",
+          "description": "Stable id copied from the prior projection. Omit on a new finding; the post-script assigns f_ plus random hex. Do not derive it from the file, line, or text."
+        }
+      },
+      "additionalProperties": false
+    },
+    "disposition": {
+      "type": "object",
+      "required": ["id", "status", "rationale", "evidence"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^f_[a-zA-Z0-9]+$" },
+        "status": {
+          "type": "string",
+          "enum": ["open", "resolved_by_change", "reclassified", "dismissed_by_human"]
+        },
+        "rationale": { "type": "string", "minLength": 1 },
+        "evidence": {
+          "type": "string",
+          "description": "Code change or human resolution that supports the status. Empty only for open."
         }
       },
       "additionalProperties": false

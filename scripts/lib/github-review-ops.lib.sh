@@ -250,6 +250,136 @@ forge_resolve_outdated_review_threads() {
   return 0
 }
 
+# --- Human dismissals ---
+
+# Print a JSON array of resolved review threads that can stand as a human
+# dismissal of a prior finding: resolved by a user who is not the PR author
+# and holds write, maintain, or admin on the repository. Bots and logins
+# that cannot be checked are never eligible. Each entry carries the thread
+# path and lines, whether the review agent itself commented in it, and any
+# finding ids stamped in the agent's comments (`finding:f_…` markers), so
+# the caller can match a thread to a ledger entry. Prints [] when nothing qualifies or any lookup fails: a dismissal
+# the runner cannot verify stays open.
+forge_get_human_dismissals() {
+  local owner name query cursor has_next page response page_nodes nodes_json
+  local pr_author login role candidates eligible
+  local -a gh_args
+
+  owner="${REPO%%/*}"
+  name="${REPO##*/}"
+  cursor=""
+  has_next="true"
+  page=0
+  nodes_json="[]"
+
+  # The author exclusion is only as good as the author lookup: without a
+  # known author nothing can be verified.
+  pr_author="$(forge_get_pr_author)"
+  if [[ -z "${pr_author}" ]]; then
+    echo "::warning::Could not determine the PR author — human dismissals cannot be verified" >&2
+    echo '[]'
+    return 0
+  fi
+
+  query='query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            isResolved
+            path
+            line
+            originalLine
+            resolvedBy { login }
+            comments(first: 100) {
+              pageInfo { hasNextPage }
+              nodes { body viewerDidAuthor }
+            }
+          }
+        }
+      }
+    }
+  }'
+
+  while [[ "${has_next}" == "true" ]]; do
+    page=$((page + 1))
+    if [[ "${page}" -gt 20 ]]; then
+      echo "::warning::Review thread pagination hit page cap — remaining threads not checked for dismissals" >&2
+      break
+    fi
+
+    gh_args=(api graphql
+      -f owner="${owner}"
+      -f name="${name}"
+      -F number="${PR_NUMBER}"
+      -f query="${query}")
+    if [[ -n "${cursor}" ]]; then
+      gh_args+=(-f cursor="${cursor}")
+    fi
+
+    if ! response=$(GH_TOKEN="${REVIEW_TOKEN}" gh "${gh_args[@]}" 2>/dev/null); then
+      echo "::warning::Failed to fetch review threads — human dismissals cannot be verified" >&2
+      echo '[]'
+      return 0
+    fi
+    if echo "${response}" | jq -e '.errors | type == "array" and length > 0' >/dev/null 2>&1; then
+      echo "::warning::Review thread query returned errors — human dismissals cannot be verified" >&2
+      echo '[]'
+      return 0
+    fi
+    page_nodes=$(echo "${response}" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || {
+      echo '[]'
+      return 0
+    }
+    nodes_json=$(jq -c --argjson page "${page_nodes}" '. + $page' <<< "${nodes_json}" 2>/dev/null) || {
+      echo '[]'
+      return 0
+    }
+    has_next=$(echo "${response}" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' 2>/dev/null) || has_next="false"
+    cursor=$(echo "${response}" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' 2>/dev/null) || cursor=""
+    if [[ "${has_next}" == "true" && -z "${cursor}" ]]; then
+      break
+    fi
+  done
+
+  # Resolved threads with a known resolver and complete comment pages. A
+  # finding id stamp counts only in a comment this token authored (the
+  # review agent's own), never in a reply anyone else wrote.
+  candidates=$(jq -c '
+    [ .[]
+      | select(type == "object")
+      | select(.isResolved == true)
+      | select((.resolvedBy.login // "") != "")
+      | select((.comments.pageInfo.hasNextPage // false) == false)
+      | {
+          path: .path,
+          line: .line,
+          original_line: .originalLine,
+          resolved_by: .resolvedBy.login,
+          agent_authored: ([ (.comments.nodes // [])[] | select(.viewerDidAuthor == true) ] | length > 0),
+          ids: ([ (.comments.nodes // [])[] | select(.viewerDidAuthor == true) | .body // "" | scan("finding:(f_[A-Za-z0-9]+)") | .[0] ] | unique)
+        }
+    ]' <<< "${nodes_json}" 2>/dev/null) || candidates="[]"
+
+  # Eligibility: not the PR author, a plain user login, and write or above
+  # on the repository. One permission lookup per distinct resolver.
+  eligible="[]"
+  while IFS= read -r login; do
+    [[ -z "${login}" ]] && continue
+    [[ "${login,,}" == "${pr_author,,}" ]] && continue
+    [[ "${login}" =~ ^[A-Za-z0-9-]+$ ]] || continue
+    role=$(GH_TOKEN="${REVIEW_TOKEN}" gh api "repos/${REPO}/collaborators/${login}/permission" \
+      --jq '.role_name' 2>/dev/null) || role=""
+    case "${role}" in
+      admin|maintain|write) eligible=$(jq -c --arg l "${login}" '. + [$l]' <<< "${eligible}") ;;
+      *) ;;
+    esac
+  done < <(jq -r '[.[].resolved_by] | unique | .[]' <<< "${candidates}" 2>/dev/null)
+
+  jq -c --argjson eligible "${eligible}" '[ .[] | select(.resolved_by as $l | $eligible | index($l) != null) ]' <<< "${candidates}" 2>/dev/null || echo '[]'
+}
+
 # --- Labels ---
 
 forge_add_label() {

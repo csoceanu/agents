@@ -327,7 +327,7 @@ run_test_custom_filename_output "nested-additional-property-shows-allowed" \
   "agent-result.json" \
   "${REVIEW_SCHEMA}" \
   "false" \
-  "allowed properties: actionable, category, description, file, line, remediation, severity"
+  "allowed properties: actionable, category, description, file, id, line, remediation, severity"
 
 # --- Structural failures ---
 

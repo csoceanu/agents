@@ -31,6 +31,39 @@ echo "  PR_NUMBER=${PR_NUMBER}"
 echo "  REPO=${REPO}"
 echo "  PR_URL=${PR_URL}"
 
+# Assign opaque ids to prior findings that predate the ledger, before the
+# sandbox reads this file. Same mint as post-review: f_ plus 16 hex chars
+# from /dev/urandom. Existing valid ids are left alone.
+mint_missing_prior_ids() {
+  local prior_file="$1"
+  local missing mint_ids tmp
+  missing="$(jq '[.findings[] | select(.id == null)] | length' "${prior_file}")"
+  if [[ ! "${missing}" =~ ^[1-9][0-9]*$ ]]; then
+    return 0
+  fi
+  mint_ids="$(
+    od -An -N"$((missing * 8))" -tx1 /dev/urandom | tr -d ' \n' | fold -w16 | head -n "${missing}" | sed 's/^/f_/' \
+      | jq -R . | jq -sc .
+  )"
+  tmp="$(mktemp "${prior_file}.mint.XXXXXX")"
+  if jq -ce --argjson mints "${mint_ids}" '
+    def valid_id: type == "string" and test("^f_[A-Za-z0-9]+$");
+    .findings = (
+      reduce .findings[] as $f ({out:[], i:0};
+        if ($f.id | valid_id) then .out += [$f]
+        elif ($mints[.i] | valid_id | not) then error("ran out of finding ids")
+        else .out += [$f + {id: $mints[.i]}] | .i += 1
+        end
+      ) | .out
+    )
+  ' "${prior_file}" > "${tmp}"; then
+    mv "${tmp}" "${prior_file}"
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Replace the human-readable sticky review with a mechanically validated,
 # structured projection before host_files copies it into the sandbox. The
@@ -80,18 +113,30 @@ validate_prior_review_projection() {
     .version as $projection_version
     | if (
       type == "object" and
-      ((keys - ["version", "findings"]) | length == 0) and
+      ((keys - ["version", "findings", "dispositions"]) | length == 0) and
       (.version | IN(1, 2)) and
       .version == $marker_version and
       (.findings | type == "array") and
       all(.findings[];
         type == "object" and
-        ((keys - ["severity", "category", "file", "line"]) | length == 0) and
+        ((keys - ["severity", "category", "file", "line", "id"]) | length == 0) and
         (.severity | IN("info", "low", "medium", "high", "critical")) and
         (.category | type == "string" and allowed_category) and
         ((.file == null and $projection_version == 2) or (.file | safe_path)) and
-        (.line == null or (.line | type == "number" and . > 0 and floor == .))
-      )
+        (.line == null or (.line | type == "number" and . > 0 and floor == .)) and
+        (.id == null or (.id | type == "string" and test("^f_[A-Za-z0-9]+$")))
+      ) and
+      ([.findings[].id | select(. != null)] | length == (unique | length)) and
+      (.dispositions == null or (
+        (.dispositions | type == "array") and
+        all(.dispositions[];
+          type == "object" and
+          ((keys - ["id", "status"]) | length == 0) and
+          (.id | type == "string" and test("^f_[A-Za-z0-9]+$")) and
+          (.status | IN("open", "resolved_by_change", "reclassified", "dismissed_by_human"))
+        ) and
+        ([.dispositions[].id] | length == (unique | length))
+      ))
     ) then {
       version: $projection_version,
       findings: [.findings[] | {
@@ -99,11 +144,21 @@ validate_prior_review_projection() {
         category: .category,
         file: .file,
         line: .line
-      }]
-    } else error("invalid prior review projection") end
+      } + (if .id == null then {} else {id: .id} end)]
+    } + (if .dispositions == null then {} else {
+      dispositions: [.dispositions[] | {id, status}]
+    } end) else error("invalid prior review projection") end
   ' > "${tmp_file}"; then
-    mv "${tmp_file}" "${prior_file}"
-    echo "Prior review projection validated"
+    # Legacy findings (v1 / v2 without id) get an opaque id before the
+    # sandbox so this review can write a disposition for them.
+    if mint_missing_prior_ids "${tmp_file}"; then
+      mv "${tmp_file}" "${prior_file}"
+      echo "Prior review projection validated"
+    else
+      : > "${prior_file}"
+      rm -f "${tmp_file}"
+      echo "::warning::Prior review projection rejected — using full first-review dispatch"
+    fi
   else
     : > "${prior_file}"
     rm -f "${tmp_file}"

@@ -171,6 +171,13 @@ forge_resolve_outdated_review_threads() {
 
 # --- Labels ---
 
+# Human dismissals need a resolved thread from a reviewer the runner can
+# vouch for. That check is not implemented for GitLab discussions, so no
+# dismissal is verified here and a dismissed_by_human disposition stays open.
+forge_get_human_dismissals() {
+  echo '[]'
+}
+
 forge_add_label() {
   local label="$1"
   if ! _gitlab_api PUT "/projects/${REPO_ENCODED}/merge_requests/${PR_NUMBER}" \
