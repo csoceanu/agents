@@ -319,6 +319,11 @@ run_prior_projection_test "approved-empty-projection-retains-action" \
   "$(projection_marker "${APPROVED_EMPTY_PROJECTION}")" \
   "app-verified" \
   "${APPROVED_EMPTY_PROJECTION}"
+INVALID_ACTION_PROJECTION='{"version":2,"action":"escalate","findings":[]}'
+run_prior_projection_test "invalid-prior-action-is-rejected" \
+  "$(projection_marker "${INVALID_ACTION_PROJECTION}")" \
+  "app-verified" \
+  "EMPTY"
 OLD_PROJECTION='{"version":1,"findings":[{"severity":"high","category":"auth-bypass","file":"old.go"}]}'
 OLD_MARKER="$(projection_marker "${OLD_PROJECTION}")"
 FIXTURE_PROJECTION='{"version":1,"findings":[{"severity":"medium","category":"missing-doc","file":"docs/foo.md","line":null}]}'

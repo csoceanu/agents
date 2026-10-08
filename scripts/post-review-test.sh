@@ -1773,6 +1773,7 @@ run_rereview_gate_case() {
   local mock_files="${9:-src/main.go}"
   local risk_enabled="${10:-false}"
   local risk_threshold="${11:-4}"
+  local expected_exit="${12:-0}"
 
   local run_dir="${TMPDIR}/run-${test_name}"
   local prior_file="${run_dir}/prior.json"
@@ -1805,7 +1806,7 @@ run_rereview_gate_case() {
   local actual_action actual_body
   actual_action="$(jq -r '.action' "${TMPDIR}/last-result.json" 2>/dev/null || true)"
   actual_body="$(jq -r '.body // ""' "${TMPDIR}/last-result.json" 2>/dev/null || true)"
-  if [[ ${exit_code} -ne 0 || "${actual_action}" != "${expected_action}" ]] || \
+  if [[ ${exit_code} -ne ${expected_exit} || "${actual_action}" != "${expected_action}" ]] || \
      ! grep -qF -- "${expected_note}" <<< "${actual_body}" || \
      { [[ -n "${forbidden_text}" ]] && grep -qF -- "${forbidden_text}" <<< "${actual_body}"; }; then
     echo "FAIL: ${test_name} — re-review gate mismatch"
@@ -1839,6 +1840,18 @@ run_rereview_gate_case "rereview-resolved-medium-allows-low-comment" \
   "approve" \
   "No medium-or-higher findings remain open"
 
+run_rereview_gate_case "rereview-approved-comment-low-becomes-approve" \
+  "$(jq -c '.action="comment" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "approve" \
+  "No medium-or-higher findings remain open"
+
+run_rereview_gate_case "rereview-low-reject-becomes-approve" \
+  "$(jq -c '.action="reject" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[]}' \
+  "approve" \
+  "No medium-or-higher findings remain open"
+
 run_rereview_gate_case "rereview-empty-approved-ledger-applies-floor" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
@@ -1852,6 +1865,26 @@ run_rereview_gate_case "rereview-approved-medium-finding-remains" \
   "request-changes" \
   "Review" \
   "minor"
+
+run_rereview_gate_case "rereview-approved-failure-remains-failure" \
+  "$(jq -c '.action="failure" | .reason="tool-failure" | del(.findings)' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "failure" \
+  "" \
+  "" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "1"
+
+run_rereview_gate_case "rereview-approved-mixed-severities-filter-low" \
+  "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"minor"},{severity:"medium",category:"logic-error",file:"new.go",line:2,description:"medium"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "- **medium** logic-error in new.go" \
+  "- **low** style in old.go"
 
 run_rereview_gate_case "rereview-stricter-threshold-is-preserved" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"medium",category:"logic-error",file:"new.go",line:1,description:"bug"}]' <<< "${BASE_REVIEW}")" \
