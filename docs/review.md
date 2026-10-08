@@ -131,9 +131,10 @@ the `actionable` flag, respecting the user's configured threshold throughout.
 On a verified re-review with a prior findings ledger, newly reported
 `info`/`low` findings do not block the review or start a fix run. After a prior
 approval, the host applies a temporary `medium` floor so low/info findings are
-omitted from the posted review. Unresolved prior `medium`/`high`/`critical`
-findings remain blocking until they receive a valid disposition. This does not
-change the global severity threshold or treat a missing finding as resolved.
+omitted from the posted review. Unresolved prior findings at or above both
+`medium` and the configured threshold remain blocking until they receive a
+valid disposition. This does not change the global severity threshold or treat
+a missing finding as resolved.
 
 ### GitLab host validation
 

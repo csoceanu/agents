@@ -102,9 +102,10 @@ On a verified re-review with a prior findings ledger, newly reported
 fix agent. If the prior verdict was `approve`, the host applies a temporary
 `medium` floor for the re-review, so low/info findings are omitted from the
 posted review. Otherwise, low/info findings may remain visible but do not
-block. Unresolved prior `medium`/`high`/`critical` findings remain blocking
-until they receive a valid disposition. This does not change the global
-severity threshold or treat a missing finding as resolved.
+block. Unresolved prior findings at or above both `medium` and the configured
+threshold remain blocking until they receive a valid disposition. This does
+not change the global severity threshold or treat a missing finding as
+resolved.
 
 ## Identity
 

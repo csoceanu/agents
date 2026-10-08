@@ -1774,6 +1774,8 @@ run_rereview_gate_case() {
   local risk_enabled="${10:-false}"
   local risk_threshold="${11:-4}"
   local expected_exit="${12:-0}"
+  local mock_files_fail="${13:-}"
+  local result_check="${14:-}"
 
   local run_dir="${TMPDIR}/run-${test_name}"
   local prior_file="${run_dir}/prior.json"
@@ -1796,7 +1798,12 @@ run_rereview_gate_case() {
     export MOCK_PR_FILES="${mock_files}"
     export REVIEW_RISK_ASSESSMENT_ENABLED="${risk_enabled}"
     export REVIEW_RISK_VERDICT_THRESHOLD="${risk_threshold}"
-    if [[ "${protected_paths}" != "__inherit__" ]]; then
+    if [[ -n "${mock_files_fail}" ]]; then
+      export MOCK_PR_FILES_FAIL="${mock_files_fail}"
+    fi
+    if [[ "${protected_paths}" = "__unset__" ]]; then
+      unset REVIEW_PROTECTED_PATHS
+    elif [[ "${protected_paths}" != "__inherit__" ]]; then
       export REVIEW_PROTECTED_PATHS="${protected_paths}"
     fi
     export PRIOR_REVIEW_FILE="${prior_file}"
@@ -1808,7 +1815,8 @@ run_rereview_gate_case() {
   actual_body="$(jq -r '.body // ""' "${TMPDIR}/last-result.json" 2>/dev/null || true)"
   if [[ ${exit_code} -ne ${expected_exit} || "${actual_action}" != "${expected_action}" ]] || \
      ! grep -qF -- "${expected_note}" <<< "${actual_body}" || \
-     { [[ -n "${forbidden_text}" ]] && grep -qF -- "${forbidden_text}" <<< "${actual_body}"; }; then
+     { [[ -n "${forbidden_text}" ]] && grep -qF -- "${forbidden_text}" <<< "${actual_body}"; } || \
+     { [[ -n "${result_check}" ]] && ! jq -e "${result_check}" "${TMPDIR}/last-result.json" >/dev/null 2>&1; }; then
     echo "FAIL: ${test_name} — re-review gate mismatch"
     echo "  expected action: '${expected_action}'"
     echo "  actual action:   '${actual_action}'"
@@ -1823,10 +1831,19 @@ run_rereview_gate_case() {
 BASE_REVIEW='{"action":"comment","pr_number":99,"repo":"test-org/test-repo","head_sha":"abcdef0123456789abcdef0123456789abcdef01","body":"Review"}'
 
 run_rereview_gate_case "rereview-new-low-does-not-request-changes" \
-  "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor",remediation:"rename it",actionable:true}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"findings":[{"severity":"low","category":"style","file":"old.go","line":1,"id":"f_closed1"}],"dispositions":[{"id":"f_closed1","status":"resolved_by_change"}]}' \
   "approve" \
-  "No medium-or-higher findings remain open"
+  "No findings at or above the effective blocking threshold remain open" \
+  "" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "" \
+  '[.findings[]? | select(.severity | IN("low", "info")) | .actionable] | length > 0 and all(. == false)'
 
 run_rereview_gate_case "rereview-prior-medium-still-blocks" \
   "$(jq -c '.findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
@@ -1834,29 +1851,45 @@ run_rereview_gate_case "rereview-prior-medium-still-blocks" \
   "request-changes" \
   "prior medium-or-higher findings remain open"
 
+run_rereview_gate_case "rereview-prior-blocker-adds-schema-valid-finding" \
+  "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_openschema"}]}' \
+  "request-changes" \
+  "prior medium-or-higher findings remain open" \
+  "" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "" \
+  '.findings | any(.id == "f_openschema" and .description == "Previously reported finding f_openschema remains open.")'
+
 run_rereview_gate_case "rereview-resolved-medium-allows-low-comment" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_closed2"}],"dispositions":[{"id":"f_closed2","status":"resolved_by_change"}]}' \
   "approve" \
-  "No medium-or-higher findings remain open"
+  "No findings at or above the effective blocking threshold remain open"
 
 run_rereview_gate_case "rereview-approved-comment-low-becomes-approve" \
   "$(jq -c '.action="comment" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
   "approve" \
-  "No medium-or-higher findings remain open"
+  "No findings at or above the effective blocking threshold remain open"
 
-run_rereview_gate_case "rereview-low-reject-becomes-approve" \
+run_rereview_gate_case "rereview-low-reject-remains-reject" \
   "$(jq -c '.action="reject" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"request-changes","findings":[]}' \
-  "approve" \
-  "No medium-or-higher findings remain open"
+  "reject" \
+  "Review" \
+  "No findings at or above the effective blocking threshold remain open"
 
 run_rereview_gate_case "rereview-empty-approved-ledger-applies-floor" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
   "approve" \
-  "No medium-or-higher findings remain open" \
+  "No findings at or above the effective blocking threshold remain open" \
   "minor"
 
 run_rereview_gate_case "rereview-approved-medium-finding-remains" \
@@ -1865,6 +1898,75 @@ run_rereview_gate_case "rereview-approved-medium-finding-remains" \
   "request-changes" \
   "Review" \
   "minor"
+
+run_rereview_gate_case "rereview-approved-unfiltered-body-is-preserved" \
+  "$(jq -c '.action="request-changes" | .body="Keep this verification context" | .findings=[{severity:"medium",category:"logic-error",file:"new.go",line:1,description:"bug"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "Keep this verification context"
+
+FILTERED_CONTEXT_BODY=$'<!-- **Head SHA:** abcdef0123456789abcdef0123456789abcdef01 -->\n\n## Review\n\n### Findings\n\n#### Low\n\n- filtered low detail\n\n#### High\n\n- original high detail\n\n### Verification\n\n- keep this verification detail\n\n### Caveats\n\n- keep this caveat\n\n### Earlier findings\n\n- f_old: resolved by change'
+run_rereview_gate_case "rereview-approved-filtered-body-preserves-nonfinding-context" \
+  "$(jq -c --arg body "${FILTERED_CONTEXT_BODY}" '.action="request-changes" | .body=$body | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"filtered low detail"},{severity:"high",category:"logic-error",file:"new.go",line:2,description:"serious bug"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "keep this verification detail" \
+  "filtered low detail" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "" \
+  '.body | contains("#### High") and contains("keep this caveat") and contains("### Earlier findings") and contains("**Head SHA:**")'
+
+FILTERED_OVERLAP_BODY=$'## Review\n\n### Findings\n\n#### Low\n\n- bug\n\n#### High\n\n- original high detail\n\n### Verification\n\n- keep this verification detail'
+run_rereview_gate_case "rereview-approved-filtered-body-ignores-retained-text-overlap" \
+  "$(jq -c --arg body "${FILTERED_OVERLAP_BODY}" '.action="request-changes" | .body=$body | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"bug"},{severity:"high",category:"logic-error",file:"new.go",line:2,description:"serious bug"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "keep this verification detail" \
+  "" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "" \
+  '.body | contains("#### High") and contains("serious bug")'
+
+FILTERED_LEAK_BODY=$'## Review\n\n### Findings\n\n#### Low\n\n- filtered low detail\n\n#### High\n\n- original high detail\n\n### Verification\n\n- keep this verification detail\n\n### Caveats\n\n- filtered low detail\n\n- keep this caveat'
+run_rereview_gate_case "rereview-approved-filtered-body-falls-back-on-leak" \
+  "$(jq -c --arg body "${FILTERED_LEAK_BODY}" '.action="request-changes" | .body=$body | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"filtered low detail"},{severity:"high",category:"logic-error",file:"new.go",line:2,description:"serious bug"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "#### High" \
+  "filtered low detail" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "" \
+  '.body | contains("keep this verification detail") | not'
+
+run_rereview_gate_case "rereview-current-high-overrides-approve" \
+  "$(jq -c '.action="approve" | .findings=[{severity:"high",category:"logic-error",file:"new.go",line:1,description:"serious bug"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "Current high or critical findings must be addressed" \
+  "" \
+  "low" \
+  "__inherit__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "" \
+  '.findings | any(.severity == "high" and .description == "serious bug")'
 
 run_rereview_gate_case "rereview-approved-failure-remains-failure" \
   "$(jq -c '.action="failure" | .reason="tool-failure" | del(.findings)' <<< "${BASE_REVIEW}")" \
@@ -1883,8 +1985,15 @@ run_rereview_gate_case "rereview-approved-mixed-severities-filter-low" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"minor"},{severity:"medium",category:"logic-error",file:"new.go",line:2,description:"medium"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
   "request-changes" \
-  "- **medium** logic-error in new.go" \
-  "- **low** style in old.go"
+  "#### Medium" \
+  "#### Low"
+
+run_rereview_gate_case "rereview-normalized-high-uses-auditable-heading" \
+  "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"minor"},{severity:"high",category:"logic-error",file:"new.go",line:2,description:"high"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "request-changes" \
+  "#### High" \
+  "- **high**"
 
 run_rereview_gate_case "rereview-stricter-threshold-is-preserved" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"medium",category:"logic-error",file:"new.go",line:1,description:"bug"}]' <<< "${BASE_REVIEW}")" \
@@ -1892,6 +2001,14 @@ run_rereview_gate_case "rereview-stricter-threshold-is-preserved" \
   "comment" \
   "no findings at or above the configured high severity threshold" \
   "logic-error in new.go" \
+  "high"
+
+run_rereview_gate_case "rereview-stricter-threshold-ignores-prior-medium" \
+  "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_below_threshold"}]}' \
+  "approve" \
+  "Review" \
+  "prior medium-or-higher findings remain open" \
   "high"
 
 run_rereview_gate_case "rereview-promotion-respects-protected-paths" \
@@ -1915,6 +2032,44 @@ run_rereview_gate_case "rereview-promotion-respects-risk-gate" \
   "src/main.go" \
   "true" \
   "4"
+
+run_rereview_gate_case "rereview-promotion-file-fetch-failure-requires-human" \
+  "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"src/main.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[]}' \
+  "comment" \
+  "Automatic re-review approval unavailable" \
+  "No findings at or above the effective blocking threshold remain open" \
+  "low" \
+  "" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "1"
+
+run_rereview_gate_case "rereview-direct-approval-file-fetch-failure-keeps-blocker" \
+  "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_fetchblock"}]}' \
+  "request-changes" \
+  "prior medium-or-higher findings remain open" \
+  "" \
+  "low" \
+  "" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "0" \
+  "1" \
+  '.findings | any(.id == "f_fetchblock")'
+
+run_rereview_gate_case "rereview-promotion-unset-protected-paths-requires-human" \
+  "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"src/main.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[]}' \
+  "comment" \
+  "Automatic re-review approval unavailable" \
+  "No findings at or above the effective blocking threshold remain open" \
+  "low" \
+  "__unset__"
 
 run_rereview_gate_case "rereview-open-prior-medium-survives-safety-gate" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"src/main.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
@@ -2100,13 +2255,13 @@ run_disposition_case "projection-assigns-id-to-legacy-prior-finding" \
   '([.findings[] | select(.file == "old.go" and .category == "logic-error" and (.id | test("^f_[A-Za-z0-9]+$")))] | length) == 1 and (.dispositions | length) == 1 and .dispositions[0].status == "open" and (.findings | length) == 2'
 
 # An approval cannot slip past an unanswered high or critical prior finding
-# that the review omitted: the action is downgraded to comment.
+# that the review omitted: the action requests changes with a carried finding.
 run_disposition_case "approve-withheld-for-unanswered-high-prior-finding" \
   "$(jq -c '.action="approve" | .findings=[]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"old.go","line":3,"id":"f_hi1"}]}' \
   '([.findings[] | select(.id == "f_hi1")] | length) == 1 and .dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-unanswered-high-prior-finding" \
-  '.action == "comment" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
 assert_disposition_stdout "approve-withheld-for-unanswered-high-prior-finding" \
   "::warning::Approval withheld: prior high/critical finding id(s) f_hi1" "present"
 
@@ -2131,14 +2286,14 @@ run_disposition_case "approve-withheld-for-explicit-open-high-prior-finding" \
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"old.go","line":3,"id":"f_hi1"}]}' \
   '.dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-explicit-open-high-prior-finding" \
-  '.action == "comment" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
 
 run_disposition_case "approve-withheld-for-empty-evidence-resolved-high-prior-finding" \
   "$(jq -c '.action="approve" | .findings=[] | .dispositions=[{id:"f_hi1",status:"resolved_by_change",rationale:"Fixed.",evidence:""}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"old.go","line":3,"id":"f_hi1"}]}' \
   '.dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-empty-evidence-resolved-high-prior-finding" \
-  '.action == "comment" and (.body | contains("Approval withheld"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld"))'
 
 # Resolving f_X must not copy that id onto a new finding in the same file
 # and category. The new row gets its own id and stays in the ledger.
@@ -2280,7 +2435,7 @@ run_disposition_case "approve-withheld-for-human-dismissed-high-prior-finding" \
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"src/add.go","line":2,"id":"f_hi1"}]}' \
   '.dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-human-dismissed-high-prior-finding" \
-  '.action == "comment" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
 assert_disposition_stdout "approve-withheld-for-human-dismissed-high-prior-finding" \
   "::warning::dismissed_by_human is not accepted for high or critical prior finding id(s) f_hi1; recorded as open" "present"
 unset MOCK_REVIEW_THREADS_JSON MOCK_PR_AUTHOR
@@ -2335,7 +2490,7 @@ run_disposition_case "approve-withheld-for-reclassified-without-finding" \
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"old.go","line":3,"id":"f_hi1"}]}' \
   '.findings == [{"severity":"high","category":"logic-error","file":"old.go","id":"f_hi1","line":3}] and .dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-reclassified-without-finding" \
-  '.action == "comment" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
 assert_disposition_stdout "approve-withheld-for-reclassified-without-finding" \
   "::warning::Reclassified prior finding id(s) f_hi1 have no current finding with that id; recorded as open" "present"
 
@@ -2362,7 +2517,7 @@ run_disposition_case "approve-withheld-for-open-high-prior-finding-re-emitted-lo
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"old.go","line":3,"id":"f_hi1"}]}' \
   '.findings == [{"severity":"high","category":"logic-error","file":"old.go","id":"f_hi1","line":3}] and .dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-open-high-prior-finding-re-emitted-lower" \
-  '.action == "comment" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
 
 # Re-emitting an open prior high finding at high still leaves it open.
 # open is not a resolution, so approval is withheld.
@@ -2371,7 +2526,7 @@ run_disposition_case "approve-withheld-for-open-high-prior-finding-re-emitted-hi
   '{"version":2,"findings":[{"severity":"high","category":"logic-error","file":"old.go","line":3,"id":"f_hi1"}]}' \
   '.findings == [{"severity":"high","category":"logic-error","file":"old.go","id":"f_hi1","line":3}] and .dispositions == [{id: "f_hi1", status: "open"}]'
 assert_last_result "approve-withheld-for-open-high-prior-finding-re-emitted-high" \
-  '.action == "comment" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
+  '.action == "request-changes" and (.body | contains("Approval withheld")) and (.body | contains("f_hi1"))'
 
 # Reclassifying a high finding to info must persist the new severity even
 # when the info row is below the posted-review threshold.
