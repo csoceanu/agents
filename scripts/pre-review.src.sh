@@ -227,7 +227,7 @@ fetch_human_dismissals() {
     return 0
   fi
 
-  jq -c --arg author "${pr_author}" --argjson trusted "${trusted_reviewers}" '
+  jq -c --arg author "${pr_author}" --arg forge "${FULLSEND_FORGE}" --argjson trusted "${trusted_reviewers}" '
     [ .threads[]
       | select(type == "object")
       | select(.is_resolved == true)
@@ -237,8 +237,14 @@ fetch_human_dismissals() {
       | select((.resolved_by | ascii_downcase) != ($author | ascii_downcase))
       | select(.comments_truncated == false)
       | .comments[]?
-      | select(.author_type == "Bot")
-      | select(.author as $login | ($trusted | map(ascii_downcase) | index($login | ascii_downcase)) != null)
+      | select(
+          if $forge == "github" then
+            (.author_type == "Bot") and
+            (.author as $login | ($trusted | map(ascii_downcase) | index($login | ascii_downcase)) != null)
+          else
+            (.author as $login | ($trusted | map(ascii_downcase) | index($login | ascii_downcase)) != null)
+          end
+        )
       | .body
       | scan("<!--[[:space:]]+finding:(f_[A-Za-z0-9]+)[[:space:]]+-->")
       | .[0]

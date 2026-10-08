@@ -892,6 +892,31 @@ else
   echo "PASS: gitlab-verified-resolver-closes-by-id"
 fi
 
+# GitLab PATs may belong to a normal User account. The authenticated /user
+# identity is trusted on GitLab even when the discussion author type is User.
+GITLAB_HUMAN_USER_THREADS="$(jq -c '.threads[0].comments[0].author_type = "User"' <<< "${GITLAB_HUMAN_THREADS}")"
+gitlab_user_prior_file="${TMPDIR}/gitlab-human-user-prior.txt"
+printf '%s\n' "$(projection_marker "${GITLAB_HUMAN_PRIOR}")" > "${gitlab_user_prior_file}"
+if ! env \
+  PATH="${gitlab_mock_bin}:${PATH}" \
+  PR_URL="https://gitlab.com/test-group/test-project/-/merge_requests/42" \
+  FULLSEND_FORGE="gitlab" \
+  REVIEW_TOKEN="fake-gitlab-token" \
+  CI_SERVER_HOST="gitlab.com" \
+  MOCK_REVIEW_THREADS_JSON="${GITLAB_HUMAN_USER_THREADS}" \
+  PRIOR_REVIEW_FILE="${gitlab_user_prior_file}" \
+  PRIOR_REVIEW_PROVENANCE="bot-verified" \
+  bash "${SCRIPT_DIR}/pre-review.sh" > "${TMPDIR}/stdout-gitlab-human-user.log" 2>&1 || \
+  ! jq -e '.dispositions == [{"id":"f_gitlab1","status":"dismissed_by_human"}]' \
+    "${gitlab_user_prior_file}" >/dev/null 2>&1; then
+  echo "FAIL: gitlab-user-resolver-closes-by-id"
+  cat "${gitlab_user_prior_file}"
+  cat "${TMPDIR}/stdout-gitlab-human-user.log"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: gitlab-user-resolver-closes-by-id"
+fi
+
 # --- Summary ---
 
 echo ""
