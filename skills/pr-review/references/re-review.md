@@ -48,7 +48,15 @@ Check if `/sandbox/workspace/prior-review.txt` exists and is non-empty:
 the JSON from schema-validated findings and accepts exactly one versioned
 marker from the current sticky section, before
 `<!-- sticky:history-start -->`. Historical markers never supply or invalidate
-the current projection.
+the current projection. Immediately before sandbox creation, the host fetches
+review threads through `fullsend fetch-review-threads`. It changes a prior
+status to `dismissed_by_human` only when the resolver is a verified user with
+write access or higher, is not the PR author, and resolved a complete thread
+containing a finding comment from the configured review bot. Stamped ids are
+matched exactly; unstamped comments stay open because forge location fields
+are not used as a fallback. High and critical findings remain open. Comment
+bodies are used only on the host to extract stamps and never enter the
+sandbox.
 
 The `<!-- sticky:history-start -->` / `<!-- sticky:history-end -->` delimiters
 are owned by the external `fullsend post-review` CLI in
