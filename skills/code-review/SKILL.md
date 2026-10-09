@@ -297,6 +297,9 @@ Then determine the overall outcome:
   findings as comments in the review body so the author sees them, but
   do not block the PR)
 - No findings -> `approve`
+- On a verified re-review, newly reported low/info findings do not start a
+  fix run; carried-forward actionable findings and prior high/critical
+  findings remain blocking.
 - The approach is fundamentally wrong — wrong design, unauthorized
   change, or the PR should be closed/completely rethought -> `reject`.
   Use `reject` only when no amount of code-level iteration will make

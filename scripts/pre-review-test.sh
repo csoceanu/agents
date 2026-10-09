@@ -435,7 +435,7 @@ run_prior_projection_test "unknown-category-fails-closed" \
   "app-verified" \
   'EMPTY'
 
-V2_ID_PROJECTION='{"version":2,"findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123"},{"severity":"high","category":"logic-error","file":"internal/bar.go","line":2,"id":"f_closed1"}],"dispositions":[{"id":"f_abc123","status":"open"},{"id":"f_closed1","status":"dismissed_by_human"}]}'
+V2_ID_PROJECTION='{"version":2,"action":"approve","findings":[{"severity":"low","category":"logic-error","file":"internal/foo.go","line":7,"id":"f_abc123","actionable":true},{"severity":"high","category":"logic-error","file":"internal/bar.go","line":2,"id":"f_closed1"}],"dispositions":[{"id":"f_abc123","status":"open"},{"id":"f_closed1","status":"dismissed_by_human"}]}'
 run_prior_projection_test "v2-id-and-disposition-retained" \
   "$(projection_marker "${V2_ID_PROJECTION}")" \
   "app-verified" \

@@ -1113,11 +1113,12 @@ PRIOR_OPEN_BLOCKING_FINDINGS="$(jq -c --argjson effective "${LEDGER_EFFECTIVE}" 
     elif . == "critical" then 4
     else 1 end;
   [ .findings[]
-    | select((.severity | severity_rank) >= $rank)
+    | select((.severity | severity_rank) >= $rank or (.actionable // false) == true)
     | select(.id as $id | any($effective[]; .id == $id and .status == "open"))
     | select((.severity == "high" or .severity == "critical")
              or (.actionable // false) == true
-             or $prior_action == "request-changes")
+             or $prior_action == "request-changes"
+             or ($prior_action == "" and (.severity | IN("medium", "high", "critical"))))
     | {
         severity,
         category,
@@ -1128,6 +1129,7 @@ PRIOR_OPEN_BLOCKING_FINDINGS="$(jq -c --argjson effective "${LEDGER_EFFECTIVE}" 
   ]
 ' <<< "${PRIOR_LEDGER}")"
 PRIOR_OPEN_BLOCKING_COUNT="$(jq 'length' <<< "${PRIOR_OPEN_BLOCKING_FINDINGS}")"
+PRIOR_OPEN_MEDIUM_PLUS_COUNT="$(jq '[.[] | select(.severity | IN("medium", "high", "critical"))] | length' <<< "${PRIOR_OPEN_BLOCKING_FINDINGS}")"
 CURRENT_HIGH_CRITICAL_COUNT="$(jq -r '[.findings[]? | select(.severity | IN("high", "critical"))] | length' "${RESULT_FILE}")"
 
 if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
@@ -1140,11 +1142,16 @@ if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
     REREVIEW_RESULT=$(mktemp)
     CLEANUP_FILES+=("${REREVIEW_RESULT}")
     REREVIEW_NOTICE=$'\n\n> **Re-review note:** No findings at or above the effective blocking threshold remain open. New low/info findings do not block this review or start a fix run.'
-    jq --arg notice "${REREVIEW_NOTICE}" --arg footer "${ACTION_HINTS_FOOTER:-}" \
+    jq --arg notice "${REREVIEW_NOTICE}" --arg footer "${ACTION_HINTS_FOOTER:-}" --argjson prior_blocking "${PRIOR_OPEN_BLOCKING_FINDINGS}" \
       '.action = "approve"
        | if has("findings") then
            .findings |= map(
-             if (.severity | IN("low", "info")) then .actionable = false else . end
+             . as $row
+             | if ($row.severity | IN("low", "info"))
+                  and ([ $prior_blocking[]?.id ] | index($row.id) == null)
+               then $row | .actionable = false
+               else $row
+               end
            )
          else . end
        | .body = (((.body // "")
@@ -1162,8 +1169,10 @@ if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
       REREVIEW_NOTICE=$'\n\n> **Re-review note:** Current high/critical findings and prior blocking findings must still be addressed.'
     elif [[ "${CURRENT_HIGH_CRITICAL_COUNT}" -gt 0 ]]; then
       REREVIEW_NOTICE=$'\n\n> **Re-review note:** Current high or critical findings must be addressed.'
-    else
+    elif [[ "${PRIOR_OPEN_MEDIUM_PLUS_COUNT}" -gt 0 ]]; then
       REREVIEW_NOTICE=$'\n\n> **Re-review note:** One or more prior medium-or-higher findings remain open and must still be addressed.'
+    else
+      REREVIEW_NOTICE=$'\n\n> **Re-review note:** One or more prior blocking findings remain open and must still be addressed.'
     fi
     if [[ -n "${ACTION_HINTS_FOOTER:-}" ]]; then
       REREVIEW_FOOTER="${ACTION_HINTS_FOOTER}"
@@ -1228,7 +1237,8 @@ PRIOR_FINDINGS_PROJECTION="$(jq -c --slurpfile unfiltered "${UNFILTERED_RESULT_F
       category,
       file: (if .file == "N/A" then null else .file end),
       id
-    } + (if (.line | type) == "number" then {line} else {} end);
+    } + (if (.line | type) == "number" then {line} else {} end)
+      + (if (.actionable | type) == "boolean" then {actionable} else {} end);
   def is_closed($accounted; $id):
     [$accounted[] | select(.id == $id and (.status | closed_status))] | length > 0;
   (.findings // []) as $findings

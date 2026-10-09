@@ -1857,6 +1857,18 @@ run_rereview_gate_case "rereview-prior-advisory-medium-does-not-block" \
   "comment" \
   "Review"
 
+run_rereview_gate_case "rereview-legacy-medium-fails-closed" \
+  "$(jq -c '.findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_legacy_medium"}]}' \
+  "request-changes" \
+  "prior medium-or-higher findings remain open"
+
+run_rereview_gate_case "rereview-carried-actionable-low-still-blocks" \
+  "$(jq -c '.findings=[{severity:"low",category:"logic-error",file:"old.go",line:1,id:"f_actionable_low",description:"still actionable",actionable:true}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[{"severity":"low","category":"logic-error","file":"old.go","line":1,"id":"f_actionable_low","actionable":true}]}' \
+  "request-changes" \
+  "prior blocking findings remain open"
+
 run_rereview_gate_case "rereview-prior-blocker-adds-schema-valid-finding" \
   "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"request-changes","findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_openschema"}]}' \

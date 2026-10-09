@@ -120,12 +120,13 @@ validate_prior_review_projection() {
       (.findings | type == "array") and
       all(.findings[];
         type == "object" and
-        ((keys - ["severity", "category", "file", "line", "id"]) | length == 0) and
+        ((keys - ["severity", "category", "file", "line", "id", "actionable"]) | length == 0) and
         (.severity | IN("info", "low", "medium", "high", "critical")) and
         (.category | type == "string" and allowed_category) and
         ((.file == null and $projection_version == 2) or (.file | safe_path)) and
         (.line == null or (.line | type == "number" and . > 0 and floor == .)) and
-        (.id == null or (.id | type == "string" and test("^f_[A-Za-z0-9]+$")))
+        (.id == null or (.id | type == "string" and test("^f_[A-Za-z0-9]+$"))) and
+        (.actionable == null or (.actionable | type == "boolean"))
       ) and
       ([.findings[].id | select(. != null)] | length == (unique | length)) and
       (.dispositions == null or (
@@ -145,7 +146,8 @@ validate_prior_review_projection() {
         category: .category,
         file: .file,
         line: .line
-      } + (if .id == null then {} else {id: .id} end)]
+      } + (if .id == null then {} else {id: .id} end)
+        + (if .actionable == null then {} else {actionable: .actionable} end)]
     } + (if .action == null then {} else {action: .action} end)
     + (if .dispositions == null then {} else {
       dispositions: [.dispositions[] | {id, status}]

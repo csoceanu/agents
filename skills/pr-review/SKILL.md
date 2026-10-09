@@ -1281,6 +1281,11 @@ adjudicated set (step 6d) and evaluate:
   a non-empty `remediation` → `approve` (observations, confirmations,
   and analysis notes at any severity level)
 - No findings → `approve`
+- On a verified re-review, newly reported low/info findings must not start a
+  fix run. They may remain visible, but the host may mark those new rows
+  non-actionable when promoting an eligible re-review to approval. Carried
+  forward actionable findings remain blocking, and prior high/critical
+  findings remain blocking.
 - **Risk verdict gate**: When `REVIEW_RISK_ASSESSMENT_ENABLED` is
   `true` and `REVIEW_RISK_VERDICT_THRESHOLD` is not `6`,
   and the risk assessment score is at or above
