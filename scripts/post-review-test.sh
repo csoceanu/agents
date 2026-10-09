@@ -1847,9 +1847,15 @@ run_rereview_gate_case "rereview-new-low-does-not-request-changes" \
 
 run_rereview_gate_case "rereview-prior-medium-still-blocks" \
   "$(jq -c '.findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
-  '{"version":2,"findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_open1"}]}' \
+  '{"version":2,"action":"request-changes","findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_open1"}]}' \
   "request-changes" \
   "prior medium-or-higher findings remain open"
+
+run_rereview_gate_case "rereview-prior-advisory-medium-does-not-block" \
+  "$(jq -c '.findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"comment","findings":[{"severity":"medium","category":"doc-style","file":"old.md","line":1,"id":"f_advisory1","actionable":false}]}' \
+  "comment" \
+  "Review"
 
 run_rereview_gate_case "rereview-prior-blocker-adds-schema-valid-finding" \
   "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
@@ -1875,8 +1881,14 @@ run_rereview_gate_case "rereview-resolved-medium-allows-low-comment" \
 run_rereview_gate_case "rereview-approved-comment-low-becomes-approve" \
   "$(jq -c '.action="comment" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
-  "approve" \
-  "No findings at or above the effective blocking threshold remain open"
+  "comment" \
+  "Review"
+
+run_rereview_gate_case "rereview-approved-empty-comment-stays-comment" \
+  "$(jq -c '.action="comment" | del(.findings) | .body="Scope is unclear; a human should confirm."' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "comment" \
+  "Scope is unclear; a human should confirm."
 
 run_rereview_gate_case "rereview-low-reject-remains-reject" \
   "$(jq -c '.action="reject" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
@@ -1885,12 +1897,11 @@ run_rereview_gate_case "rereview-low-reject-remains-reject" \
   "Review" \
   "No findings at or above the effective blocking threshold remain open"
 
-run_rereview_gate_case "rereview-empty-approved-ledger-applies-floor" \
+run_rereview_gate_case "rereview-approved-ledger-keeps-low-visible" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"new.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
   "approve" \
-  "No findings at or above the effective blocking threshold remain open" \
-  "minor"
+  "No findings at or above the effective blocking threshold remain open"
 
 run_rereview_gate_case "rereview-approved-medium-finding-remains" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"medium",category:"logic-error",file:"new.go",line:1,description:"bug"}]' <<< "${BASE_REVIEW}")" \
@@ -1912,7 +1923,7 @@ run_rereview_gate_case "rereview-approved-filtered-body-preserves-nonfinding-con
   "request-changes" \
   "keep this verification detail" \
   "filtered low detail" \
-  "low" \
+  "medium" \
   "__inherit__" \
   "src/main.go" \
   "false" \
@@ -1928,7 +1939,7 @@ run_rereview_gate_case "rereview-approved-filtered-body-ignores-retained-text-ov
   "request-changes" \
   "keep this verification detail" \
   "" \
-  "low" \
+  "medium" \
   "__inherit__" \
   "src/main.go" \
   "false" \
@@ -1944,7 +1955,7 @@ run_rereview_gate_case "rereview-approved-filtered-body-falls-back-on-leak" \
   "request-changes" \
   "#### High" \
   "filtered low detail" \
-  "low" \
+  "medium" \
   "__inherit__" \
   "src/main.go" \
   "false" \
@@ -1986,14 +1997,16 @@ run_rereview_gate_case "rereview-approved-mixed-severities-filter-low" \
   '{"version":2,"action":"approve","findings":[]}' \
   "request-changes" \
   "#### Medium" \
-  "#### Low"
+  "#### Low" \
+  "medium"
 
 run_rereview_gate_case "rereview-normalized-high-uses-auditable-heading" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"old.go",line:1,description:"minor"},{severity:"high",category:"logic-error",file:"new.go",line:2,description:"high"}]' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"approve","findings":[]}' \
   "request-changes" \
   "#### High" \
-  "- **high**"
+  "- **high**" \
+  "medium"
 
 run_rereview_gate_case "rereview-stricter-threshold-is-preserved" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"medium",category:"logic-error",file:"new.go",line:1,description:"bug"}]' <<< "${BASE_REVIEW}")" \
@@ -2020,6 +2033,14 @@ run_rereview_gate_case "rereview-promotion-respects-protected-paths" \
   "low" \
   "src/" \
   "src/main.go"
+
+run_rereview_gate_case "rereview-promotion-rejects-protected-path-finding" \
+  "$(jq -c '.action="request-changes" | .findings=[{severity:"info",category:"protected-path",file:"docs/review.md",line:1,description:"human review required"}]' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"request-changes","findings":[]}' \
+  "comment" \
+  "Automatic re-review approval unavailable" \
+  "" \
+  "info"
 
 run_rereview_gate_case "rereview-promotion-respects-risk-gate" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"src/main.go",line:1,description:"minor"}] | .risk_assessment={score:5,level:"high",rationale:"high risk"}' <<< "${BASE_REVIEW}")" \
@@ -2050,17 +2071,16 @@ run_rereview_gate_case "rereview-promotion-file-fetch-failure-requires-human" \
 run_rereview_gate_case "rereview-direct-approval-file-fetch-failure-keeps-blocker" \
   "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
   '{"version":2,"action":"request-changes","findings":[{"severity":"medium","category":"logic-error","file":"old.go","line":1,"id":"f_fetchblock"}]}' \
-  "request-changes" \
-  "prior medium-or-higher findings remain open" \
+  "" \
+  "" \
   "" \
   "low" \
   "" \
   "src/main.go" \
   "false" \
   "4" \
-  "0" \
   "1" \
-  '.findings | any(.id == "f_fetchblock")'
+  "1"
 
 run_rereview_gate_case "rereview-promotion-unset-protected-paths-requires-human" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"src/main.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \
@@ -2070,6 +2090,19 @@ run_rereview_gate_case "rereview-promotion-unset-protected-paths-requires-human"
   "No findings at or above the effective blocking threshold remain open" \
   "low" \
   "__unset__"
+
+run_rereview_gate_case "rereview-direct-approval-unset-protected-paths-fails-closed" \
+  "$(jq -c '.action="approve" | del(.findings)' <<< "${BASE_REVIEW}")" \
+  '{"version":2,"action":"approve","findings":[]}' \
+  "" \
+  "" \
+  "" \
+  "low" \
+  "__unset__" \
+  "src/main.go" \
+  "false" \
+  "4" \
+  "1"
 
 run_rereview_gate_case "rereview-open-prior-medium-survives-safety-gate" \
   "$(jq -c '.action="request-changes" | .findings=[{severity:"low",category:"style",file:"src/main.go",line:1,description:"minor"}]' <<< "${BASE_REVIEW}")" \

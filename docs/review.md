@@ -129,12 +129,13 @@ The severity threshold is absolute — it applies to all findings regardless of
 the `actionable` flag, respecting the user's configured threshold throughout.
 
 On a verified re-review with a prior findings ledger, newly reported
-`info`/`low` findings do not block the review or start a fix run. After a prior
-approval, the host applies a temporary `medium` floor so low/info findings are
-omitted from the posted review. Unresolved prior findings at or above both
-`medium` and the configured threshold remain blocking until they receive a
-valid disposition. This does not change the global severity threshold or treat
-a missing finding as resolved.
+`info`/`low` findings do not block the review or start a fix run. They may
+remain visible in the posted review, but are marked non-actionable by the host
+when the review is promoted to approval. A prior medium-or-higher finding
+blocks only when the prior review was itself `request-changes` or the finding
+was explicitly marked actionable; an advisory comment-only medium remains
+advisory. This does not change the global severity threshold or treat a
+missing finding as resolved.
 
 ### GitLab host validation
 

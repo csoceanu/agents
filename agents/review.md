@@ -99,13 +99,12 @@ findings regardless of the `actionable` flag.
 
 On a verified re-review with a prior findings ledger, newly reported
 `info`/`low` findings must not produce a `request-changes` verdict or start the
-fix agent. If the prior verdict was `approve`, the host applies a temporary
-`medium` floor for the re-review, so low/info findings are omitted from the
-posted review. Otherwise, low/info findings may remain visible but do not
-block. Unresolved prior findings at or above both `medium` and the configured
-threshold remain blocking until they receive a valid disposition. This does
-not change the global severity threshold or treat a missing finding as
-resolved.
+fix agent. They may remain visible in the posted review, but are marked
+non-actionable by the host when the review is promoted to approval. A prior
+medium-or-higher finding blocks only when the prior review was itself
+`request-changes` or the finding was explicitly marked actionable; an advisory
+comment-only medium remains advisory. This does not change the global severity
+threshold or treat a missing finding as resolved.
 
 ## Identity
 

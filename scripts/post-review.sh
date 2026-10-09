@@ -981,16 +981,9 @@ severity_rank() {
 }
 
 EFFECTIVE_FINDING_SEVERITY_THRESHOLD="${REVIEW_FINDING_SEVERITY_THRESHOLD}"
-if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" && "${PRIOR_ACTION}" = "approve" ]]; then
-  # After an approval, keep only medium+ findings in the posted review. This
-  # is a per-re-review floor; the configured global default remains low.
-  if [[ "$(severity_rank "${REVIEW_FINDING_SEVERITY_THRESHOLD}")" -lt "$(severity_rank medium)" ]]; then
-    EFFECTIVE_FINDING_SEVERITY_THRESHOLD="medium"
-    echo "Prior review was approved — applying medium severity floor for this re-review"
-  fi
-fi
 threshold_rank=$(severity_rank "$EFFECTIVE_FINDING_SEVERITY_THRESHOLD")
 FILTERED_FINDINGS=false
+REREVIEW_FILTERED_TO_ZERO=false
 
 if jq -e '.findings' "${RESULT_FILE}" >/dev/null 2>&1; then
   original_count=$(jq '.findings | length' "${RESULT_FILE}")
@@ -1020,6 +1013,7 @@ if jq -e '.findings' "${RESULT_FILE}" >/dev/null 2>&1; then
     # findings are filtered (#1046). Use "comment" (not "approve") so
     # the PR gets requires-manual-review, not ready-for-merge.
     if [ "${filtered_count}" -eq 0 ]; then
+      REREVIEW_FILTERED_TO_ZERO=true
       original_action=$(jq -r '.action' "${FILTERED_RESULT}")
       DOWNGRADE_RESULT=$(mktemp)
       CLEANUP_FILES+=("${DOWNGRADE_RESULT}")
@@ -1196,6 +1190,14 @@ fail_rereview_safety_check() {
   DOWNGRADED=true
 }
 
+# A protected-path finding is never eligible for automatic approval, even when
+# severity filtering would otherwise remove it or the configured path list is
+# empty. The finding category is the agent's explicit safety signal.
+if [[ "${ACTION}" = "approve" ]] \
+    && jq -e '[.findings[]? | select(.category == "protected-path")] | length > 0' "${UNFILTERED_RESULT_FILE}" >/dev/null; then
+  fail_rereview_safety_check "Protected-path finding present in review result"
+fi
+
 if [ "${ACTION}" = "approve" ]; then
   REREVIEW_SAFETY_CHECK_READY=true
   REVIEW_ACTIVE_PROTECTED_PATHS=()
@@ -1203,7 +1205,7 @@ if [ "${ACTION}" = "approve" ]; then
   # overridable per-repo via harness composition), so an unset value here
   # indicates a genuine misconfiguration rather than an intentional opt-out.
   if [[ "${REVIEW_PROTECTED_PATHS+set}" != "set" ]]; then
-    if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
+    if [[ "${REREVIEW_SAFETY_CANDIDATE}" = "true" ]]; then
       fail_rereview_safety_check "REVIEW_PROTECTED_PATHS is not set"
       REREVIEW_SAFETY_CHECK_READY=false
     else
@@ -1238,7 +1240,7 @@ if [ "${ACTION}" = "approve" ]; then
       sanitized_paths="${sanitized_paths//:/}"
       invalid_paths_message="REVIEW_PROTECTED_PATHS=\"${sanitized_paths}\" contains no valid path entries after trimming"
       unset sanitized_paths
-      if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
+      if [[ "${REREVIEW_SAFETY_CANDIDATE}" = "true" ]]; then
         fail_rereview_safety_check "${invalid_paths_message}"
         REREVIEW_SAFETY_CHECK_READY=false
       else
@@ -1280,7 +1282,7 @@ if [ "${ACTION}" = "approve" ]; then
   fi
   if [[ "${REREVIEW_SAFETY_CHECK_READY}" = "true" ]] \
       && { [ "${PR_FILES_FETCH_FAILED}" = true ] || [ -z "${PR_FILES}" ]; }; then
-    if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
+    if [[ "${REREVIEW_SAFETY_CANDIDATE}" = "true" ]]; then
       fail_rereview_safety_check "Failed to fetch PR files or PR has no changed files"
       REREVIEW_SAFETY_CHECK_READY=false
     else
@@ -1807,10 +1809,11 @@ fi
 
 # Re-review severity gate. A verified prior ledger means this is a re-review;
 # do not let a newly discovered low/info finding start a fix run or block the
-# PR. Unresolved prior findings at or above medium and the effective configured
-# threshold remain blocking. The global default remains low, so first reviews
-# still report low findings normally.
-PRIOR_OPEN_BLOCKING_FINDINGS="$(jq -c --argjson effective "${LEDGER_EFFECTIVE}" --argjson rank "${REREVIEW_BLOCKING_RANK}" '
+# PR. Prior high/critical findings remain blocking; prior medium findings block
+# when the prior review requested changes or the finding was actionable. The
+# global default remains low, so first reviews still report low findings
+# normally.
+PRIOR_OPEN_BLOCKING_FINDINGS="$(jq -c --argjson effective "${LEDGER_EFFECTIVE}" --argjson rank "${REREVIEW_BLOCKING_RANK}" --arg prior_action "${PRIOR_ACTION}" '
   def severity_rank:
     if . == "info" then 0
     elif . == "low" then 1
@@ -1821,6 +1824,9 @@ PRIOR_OPEN_BLOCKING_FINDINGS="$(jq -c --argjson effective "${LEDGER_EFFECTIVE}" 
   [ .findings[]
     | select((.severity | severity_rank) >= $rank)
     | select(.id as $id | any($effective[]; .id == $id and .status == "open"))
+    | select((.severity == "high" or .severity == "critical")
+             or (.actionable // false) == true
+             or $prior_action == "request-changes")
     | {
         severity,
         category,
@@ -1835,7 +1841,7 @@ CURRENT_HIGH_CRITICAL_COUNT="$(jq -r '[.findings[]? | select(.severity | IN("hig
 
 if [[ "${HAS_VALID_PRIOR_REVIEW}" = "true" ]]; then
   if [[ "${ACTION}" = "request-changes" \
-      || ( "${ACTION}" = "comment" && "${PRIOR_ACTION}" = "approve" && "${DOWNGRADED}" = "false" ) ]] \
+      || ( "${ACTION}" = "comment" && "${PRIOR_ACTION}" = "approve" && "${REREVIEW_FILTERED_TO_ZERO}" = "true" && "${DOWNGRADED}" = "false" ) ]] \
       && [[ "${PRIOR_OPEN_BLOCKING_COUNT}" -eq 0 ]] \
       && [[ "${REREVIEW_CURRENT_MEDIUM_PLUS_COUNT}" -eq 0 ]] \
       && [[ "${DOWNGRADED}" = "false" ]]; then
